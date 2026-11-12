@@ -79,7 +79,7 @@ export class Luxtronik1 extends utils.Adapter {
 
     private deviceIpAddress = '';
     private port = 0;
-    private pollingTimer: ioBroker.Interval | null = null;
+    private pollingTimer: ioBroker.Interval | null | undefined = null;
     private unloaded = false;
 
     private activeSocket: net.Socket | null = null;
@@ -198,7 +198,7 @@ export class Luxtronik1 extends utils.Adapter {
         this.unloaded = true;
         if (this.pollingTimer) {
             this.clearInterval(this.pollingTimer);
-            this.pollingTimer = null;
+            this.pollingTimer = undefined;
         }
         this.timers.forEach((t) => this.clearTimeout(t));
         this.timers.clear();
