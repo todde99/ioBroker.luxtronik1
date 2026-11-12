@@ -3,6 +3,19 @@
     "name": "luxtronik1",
     "version": "0.5.0",
     "news": {
+      "0.5.0": {
+        "en": "Migrated adapter to TypeScript\nHardened RS232 socket communication and priority command queue\nReplaced Materialize admin UI with modern jsonConfig",
+        "de": "Adapter auf TypeScript umgestellt\nRS232-Socket-Kommunikation und Prioritäts-Warteschlange gehärtet\nAdmin-Oberfläche von Materialize auf moderne jsonConfig umgestellt",
+        "ru": "Адаптер переведен на TypeScript\nУлучшена связь по сокету RS232 и очередь приоритетных команд\nИнтерфейс администратора переведен с Materialize на jsonConfig",
+        "pt": "Adaptador migrado para TypeScript\nComunicação de soquete RS232 mais robusta e fila de comandos prioritários\nInterface de administração alterada de Materialize para jsonConfig",
+        "nl": "Adapter gemigreerd naar TypeScript\nRS232-socketcommunicatie en prioriteitswachtrij verbeterd\nMaterialize-beheerinterface vervangen door moderne jsonConfig",
+        "fr": "Migration de l'adaptateur vers TypeScript\nCommunication socket RS232 et file d'attente prioritaire renforcées\nInterface d'administration Materialize remplacée par jsonConfig",
+        "it": "Adattatore migrato a TypeScript\nComunicazione socket RS232 e coda comandi prioritaria migliorate\nInterfaccia di amministrazione sostituita con jsonConfig",
+        "es": "Adaptador migrado a TypeScript\nComunicación por socket RS232 y cola de prioridad mejoradas\nInterfaz de administración Materialize reemplazada por jsonConfig",
+        "pl": "Migracja adaptera do TypeScript\nWzmocniona komunikacja RS232 i kolejka priorytetowa poleceń\nZastąpiono interfejs Materialize nowoczesnym jsonConfig",
+        "uk": "Адаптер переведено на TypeScript\nПокращено з'єднання RS232 та чергу пріоритетних команд\nІнтерфейс адміністратора змінено з Materialize на jsonConfig",
+        "zh-cn": "将适配器迁移到 TypeScript\n强化了 RS232 套接字通信和优先级命令队列\n将 Materialize 管理界面替换为现代 jsonConfig"
+      },
       "0.4.1": {
         "en": "Workflow has been fixed",
         "de": "Der Workflow wurde behoben",
