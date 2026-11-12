@@ -1,0 +1,113 @@
+{
+  "i18n": false,
+  "type": "panel",
+  "items": {
+    "_header": {
+      "type": "header",
+      "text": {
+        "en": "Luxtronik 1 Connection Settings",
+        "de": "Luxtronik 1 Verbindungseinstellungen"
+      },
+      "size": 3
+    },
+    "host": {
+      "type": "text",
+      "label": {
+        "en": "IP address or hostname",
+        "de": "IP-Adresse oder Hostname"
+      },
+      "help": {
+        "en": "IP address of the RS232-to-LAN converter (e.g. 192.168.178.50)",
+        "de": "IP-Adresse des RS232-LAN-Konverters (z. B. 192.168.178.50)"
+      },
+      "placeholder": "192.168.178.x",
+      "validator": "!!data.host && data.host.trim().length > 0",
+      "validatorNoSaveOnError": true,
+      "xs": 12,
+      "sm": 8,
+      "md": 6,
+      "lg": 4
+    },
+    "port": {
+      "type": "number",
+      "label": {
+        "en": "TCP Port",
+        "de": "TCP-Port"
+      },
+      "help": {
+        "en": "Port of the RS232 converter (1 - 65535)",
+        "de": "Port des RS232-Konverters (1 - 65535)"
+      },
+      "min": 1,
+      "max": 65535,
+      "step": 1,
+      "default": 8888,
+      "validator": "data.port >= 1 && data.port <= 65535",
+      "validatorNoSaveOnError": true,
+      "xs": 12,
+      "sm": 4,
+      "md": 3,
+      "lg": 2,
+      "newLine": false
+    },
+    "_divider": {
+      "type": "divider",
+      "newLine": true
+    },
+    "pollInterval": {
+      "type": "number",
+      "label": {
+        "en": "Polling interval (ms)",
+        "de": "Abfrageintervall (ms)"
+      },
+      "help": {
+        "en": "Interval between status queries in milliseconds (min. 10000 ms, default: 300000 ms)",
+        "de": "Abfrageintervall in Millisekunden (min. 10000 ms, Standard: 300000 ms)"
+      },
+      "min": 10000,
+      "max": 3600000,
+      "step": 1000,
+      "default": 300000,
+      "unit": "ms",
+      "validator": "data.pollInterval >= 10000",
+      "validatorNoSaveOnError": true,
+      "xs": 12,
+      "sm": 6,
+      "md": 4,
+      "lg": 4,
+      "newLine": true
+    },
+    "socketTimeout": {
+      "type": "number",
+      "label": {
+        "en": "Socket timeout (ms)",
+        "de": "Verbindungs-Timeout (ms)"
+      },
+      "help": {
+        "en": "Timeout per query in milliseconds (2000 - 60000 ms, default: 15000 ms)",
+        "de": "Timeout pro Einzelabfrage in Millisekunden (2000 - 60000 ms, Standard: 15000 ms)"
+      },
+      "min": 2000,
+      "max": 60000,
+      "step": 500,
+      "default": 15000,
+      "unit": "ms",
+      "validator": "data.socketTimeout >= 2000 && data.socketTimeout <= 60000",
+      "validatorNoSaveOnError": true,
+      "xs": 12,
+      "sm": 6,
+      "md": 4,
+      "lg": 4,
+      "newLine": false
+    },
+    "_info": {
+      "type": "staticText",
+      "text": {
+        "en": "On save, the adapter restarts with the new configuration immediately.",
+        "de": "Beim Speichern startet der Adapter sofort mit der neuen Konfiguration neu."
+      },
+      "xs": 12,
+      "newLine": true
+    }
+  }
+}
