@@ -1,7 +1,7 @@
 {
   "common": {
     "name": "luxtronik1",
-    "version": "0.4.2-alpha.9",
+    "version": "0.5.0",
     "news": {
       "0.4.1": {
         "en": "Workflow has been fixed",
