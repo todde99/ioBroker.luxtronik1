@@ -12,31 +12,38 @@
 <script type="text/javascript" src="../../lib/js/materialize.js"></script>
 <script type="text/javascript" src="../../js/adapter-settings.js"></script>
 <script type="text/javascript" src="words.js"></script>
- <style>
-  .m .col .select-wrapper+label {
-   top: -26px;
-  }
-     .m span{
-         font-size: 0.9em;
-     }
- </style>
-<!-- you have to define 2 functions in the global scope: -->
+<style>
+    .m .col .select-wrapper+label {
+        top: -26px;
+    }
+    .m span.helper-text {
+        font-size: 0.85em;
+        color: #757575;
+    }
+</style>
 <script type="text/javascript">
-    // the function loadSettings has to exist ...
+    var DEFAULTS = {
+        host: '',
+        port: 8888,
+        pollInterval: 300000,
+        socketTimeout: 15000
+    };
+
     function load(settings, onChange) {
-        // example: select elements with id=key and class=value and insert value
-       if (!settings) return;
+        if (!settings) return;
         $('.value').each(function () {
             var $key = $(this);
             var id = $key.attr('id');
+            var val = (settings[id] !== undefined && settings[id] !== null && settings[id] !== '')
+                ? settings[id]
+                : DEFAULTS[id];
+
             if ($key.attr('type') === 'checkbox') {
-		        // do not call onChange direct, because onChange could expect some arguments
-                $key.prop('checked', settings[id]).on('change', function() {
+                $key.prop('checked', !!val).on('change', function() {
                     onChange();
                 });
             } else {
-		        // do not call onChange direct, because onChange could expect some arguments
-                $key.val(settings[id]).on('change', function() {
+                $key.val(val).on('change', function() {
                     onChange();
                 }).on('keyup', function() {
                     onChange();
@@ -44,19 +51,25 @@
             }
         });
         onChange(false);
-        M.updateTextFields();  // function Materialize.updateTextFields(); to reinitialize all the Materialize labels on the page if you are dynamically adding inputs.
+        if (typeof M !== 'undefined' && M.updateTextFields) {
+            M.updateTextFields();
+        }
     }
-    // ... and the function save has to exist.
-    // you have to make sure the callback is called with the settings object as first param!
+
     function save(callback) {
-        // example: select elements with class=value and build settings object
         var obj = {};
         $('.value').each(function () {
             var $this = $(this);
-            if ($this.attr('type') === 'checkbox') {
-                obj[$this.attr('id')] = $this.prop('checked');
+            var id = $this.attr('id');
+            var type = $this.attr('type');
+
+            if (type === 'checkbox') {
+                obj[id] = $this.prop('checked');
+            } else if (type === 'number') {
+                var num = parseInt($this.val(), 10);
+                obj[id] = isNaN(num) ? (DEFAULTS[id] || 0) : num;
             } else {
-                obj[$this.attr('id')] = $this.val();
+                obj[id] = String($this.val() || '').trim();
             }
         });
         callback(obj);
@@ -64,35 +77,35 @@
 </script>
 </head>
 <body>
-    <!-- you have to put your config page in a div with id adapter-container -->
     <div class="m adapter-container">
         <div class="row">
-            <!-- Forms are the standard way to receive user inputted data.
-         Learn more http://materializecss.com/forms.html-->
             <div class="row">
                 <div class="input-field col s6">
                     <img src="luxtronik1.png" class="logo">
                 </div>
             </div>
             <div class="row">
-                <div class="input-field col col s3">
-                    <input class="value" id="host" type="text"/>
+                <div class="input-field col s12 m6 l4">
+                    <input class="value" id="host" type="text" placeholder="192.168.178.x"/>
                     <label for="host" class="translate">host</label>
-                    <span class="translate">host</span>
+                    <span class="helper-text translate">IP-Adresse des RS232-LAN-Konverters</span>
                 </div>
-			</div>
-			<div class="row">
-                <div class="input-field col col s3">
-                    <input class="value" id="port" type="number"/>
+                <div class="input-field col s12 m4 l2">
+                    <input class="value" id="port" type="number" min="1" max="65535"/>
                     <label for="port" class="translate">port</label>
-                 </div>
-	     </div>
+                    <span class="helper-text translate">TCP-Port (1 - 65535)</span>
+                </div>
+            </div>
             <div class="row">
                 <div class="input-field col s12 m6 l4">
-                    <input type="number" class="value" id="pollInterval" min="10000" />
+                    <input class="value" id="pollInterval" type="number" min="10000" step="1000"/>
                     <label for="pollInterval" class="translate">pollInterval</label>
-                    <!-- Important: label must come directly after input. Label is important. -->
-                    <span class="translate">pollInterval</span>
+                    <span class="helper-text translate">Abfrageintervall in ms (min. 10000)</span>
+                </div>
+                <div class="input-field col s12 m6 l4">
+                    <input class="value" id="socketTimeout" type="number" min="2000" max="60000" step="500"/>
+                    <label for="socketTimeout" class="translate">socketTimeout</label>
+                    <span class="helper-text translate">Socket-Timeout in ms (Standard: 15000)</span>
                 </div>
             </div>
             <div class="row">
@@ -103,5 +116,4 @@
         </div>
     </div>
 </body>
-
 </html>
