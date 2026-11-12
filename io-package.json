@@ -163,7 +163,7 @@
   },
   "native": {
     "host": "",
-    "port": 0,
+    "port": 8888,
     "pollInterval": 300000,
     "socketTimeout": 15000
   },
