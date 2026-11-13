@@ -129,7 +129,7 @@ export class Luxtronik1 extends utils.Adapter {
 
         const pollingTime = Math.max(Number(this.config.pollInterval) || 300000, 10000);
         this.log.info(
-            `[START] Luxtronik-Adapter v0.5.2 gestartet (${this.deviceIpAddress}:${this.port}, Intervall: ${pollingTime} ms)`
+            `[START] Luxtronik-Adapter v0.5.3 gestartet (${this.deviceIpAddress}:${this.port}, Intervall: ${pollingTime} ms)`
         );
 
         this.subscribeStates('control.*');
@@ -190,6 +190,22 @@ export class Luxtronik1 extends utils.Adapter {
         }
     }
 
+    private closeSocketGracefully(socket: net.Socket): void {
+        if (socket.destroyed) {
+            return;
+        }
+        try {
+            socket.end();
+        } catch {
+            /* ignore */
+        }
+        this.later(() => {
+            if (!socket.destroyed) {
+                socket.destroy();
+            }
+        }, 150);
+    }
+
     private shutdown(): void {
         this.unloaded = true;
         if (this.pollingTimer) {
@@ -248,8 +264,8 @@ export class Luxtronik1 extends utils.Adapter {
         }
 
         this.isProcessingQueue = true;
-        // 2500 ms Pause nach Schreibbefehlen (EEPROM-Speicherung), sonst 500 ms
-        const delayAfterMs = nextItem.name.startsWith('write_') ? 2500 : 500;
+        // Nach einem Schreibbefehl 2500 ms Pause (EEPROM), zwischen Leseabfragen 600 ms Pause für den Konverter
+        const delayAfterMs = nextItem.name.startsWith('write_') ? 2500 : 600;
 
         try {
             void nextItem.taskFn(() => {
@@ -259,7 +275,7 @@ export class Luxtronik1 extends utils.Adapter {
         } catch (e) {
             this.log.warn(`Fehler bei Ausführung von ${nextItem.name}: ${String(e)}`);
             this.isProcessingQueue = false;
-            this.later(() => this.processQueues(), 500);
+            this.later(() => this.processQueues(), 600);
         }
     }
 
@@ -292,8 +308,7 @@ export class Luxtronik1 extends utils.Adapter {
         cmd: string,
         isCompleteFn: (buf: string) => boolean,
         parseFn: (raw: string) => Promise<boolean> | boolean,
-        doneCallback: (success?: boolean) => void,
-        isRetry = false
+        doneCallback: (success?: boolean) => void
     ): void {
         if (this.unloaded) {
             doneCallback(false);
@@ -304,8 +319,8 @@ export class Luxtronik1 extends utils.Adapter {
         let timedOut = false;
         let hadError = false;
         let connected = false;
-        let stalledShortRead = false;
-        let stallTimer: ioBroker.Timeout | undefined;
+        let retransmitDone = false;
+        let wakeRetryTimer: ioBroker.Timeout | undefined;
 
         const idleTimeout = Number(this.config.socketTimeout) || 15000;
         const socket = new net.Socket();
@@ -315,52 +330,60 @@ export class Luxtronik1 extends utils.Adapter {
 
         const hardTimer = this.later(() => {
             if (!socket.destroyed) {
-                this.log.warn(`${cmd}: Hard-Timeout erreicht, Verbindung wird geschlossen`);
+                this.log.warn(`[v0.5.3] ${cmd}: Hard-Timeout erreicht, Verbindung wird geschlossen`);
                 timedOut = true;
                 socket.destroy();
             }
         }, idleTimeout * 3);
 
+        // Falls nach 2,5 Sekunden 0 Zeichen oder nur ein kurzes Echo (18/23 Zeichen) kamen:
+        // Auf demselben offenen Socket 999\r\n (Reset Editiermodus) und danach den Befehl erneut senden!
+        const scheduleWakeRetransmit = (): void => {
+            this.clearTrackedTimer(wakeRetryTimer);
+            if (retransmitDone) {
+                return;
+            }
+            wakeRetryTimer = this.later(() => {
+                if (!socket.destroyed && socket.writable && !isCompleteFn(rxBuffer)) {
+                    retransmitDone = true;
+                    const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+                    this.log.debug(
+                        `[v0.5.3] ${cmd}: Nach 2500 ms erst ${rxBuffer.length} Bytes ("${preview}"), sende Wake-up & Retransmit auf offener Verbindung...`
+                    );
+                    rxBuffer = '';
+                    socket.write('999\r\n');
+                    this.later(() => {
+                        if (!socket.destroyed && socket.writable) {
+                            rxBuffer = '';
+                            socket.write(`${cmd}\r\n`);
+                        }
+                    }, 400);
+                }
+            }, 2500);
+        };
+
         socket.on('connect', () => {
             connected = true;
-            this.log.debug(`${cmd}: Verbunden mit Luxtronik`);
-            // Wie im Original sofort synchron nach dem Connect senden!
+            this.log.debug(`[v0.5.3] ${cmd}: Verbunden mit Luxtronik`);
             socket.write(`${cmd}\r\n`);
+            scheduleWakeRetransmit();
         });
 
         socket.on('data', (chunk: Buffer) => {
             rxBuffer += chunk.toString('utf8');
-            this.clearTrackedTimer(stallTimer);
 
             try {
                 if (isCompleteFn(rxBuffer)) {
-                    this.log.debug(`${cmd}: Daten vollständig empfangen (${rxBuffer.length} Zeichen)`);
-                    socket.destroy();
+                    this.clearTrackedTimer(wakeRetryTimer);
+                    this.log.debug(`[v0.5.3] ${cmd}: Daten vollständig (${rxBuffer.length} Bytes)`);
+                    this.closeSocketGracefully(socket);
                     return;
                 }
 
-                // Wenn Daten begonnen haben (z. B. 18 oder 23 Zeichen Echo/Fehlercode), aber nach 1800 ms
-                // nichts mehr nachkommt, hängt die Luxtronik im Editiermodus oder hat den Befehl verschluckt:
-                // Nicht 15s warten, sondern 999 senden, schließen und 1x sofort wiederholen!
-                stallTimer = this.later(() => {
-                    if (!socket.destroyed && !isCompleteFn(rxBuffer)) {
-                        stalledShortRead = true;
-                        const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-                        this.log.debug(
-                            `${cmd}: Antwort nach ${rxBuffer.length} Zeichen gestockt ("${preview}"), sende Reset (999) und wiederhole...`
-                        );
-                        if (socket.writable) {
-                            socket.write('999\r\n');
-                        }
-                        this.later(() => {
-                            if (!socket.destroyed) {
-                                socket.destroy();
-                            }
-                        }, 400);
-                    }
-                }, 1800);
+                // Falls noch unvollständig (z. B. erst 18 oder 23 Bytes Echo/779), Timer neu starten
+                scheduleWakeRetransmit();
             } catch (e) {
-                this.log.warn(`${cmd}: Fehler bei Vollständigkeitsprüfung: ${String(e)}`);
+                this.log.warn(`[v0.5.3] ${cmd}: Fehler bei Vollständigkeitsprüfung: ${String(e)}`);
             }
         });
 
@@ -369,44 +392,29 @@ export class Luxtronik1 extends utils.Adapter {
             const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
             if (connected) {
                 this.log.warn(
-                    `${cmd}: Timeout nach ${idleTimeout} ms (${rxBuffer.length} Zeichen empfangen, Rohdaten: "${preview}")`
+                    `[v0.5.3] ${cmd}: Timeout nach ${idleTimeout} ms (${rxBuffer.length} Bytes, Rohdaten: "${preview}")`
                 );
             } else {
-                this.log.warn(`${cmd}: Keine Verbindung zum RS232-Konverter möglich (Timeout ${idleTimeout} ms)`);
+                this.log.warn(
+                    `[v0.5.3] ${cmd}: Keine Verbindung zum RS232-Konverter möglich (Timeout ${idleTimeout} ms)`
+                );
             }
             socket.destroy();
         });
 
         socket.on('error', (err: Error) => {
             hadError = true;
-            this.log.warn(`${cmd} Socket-Fehler: ${err.message}`);
+            this.log.warn(`[v0.5.3] ${cmd} Socket-Fehler: ${err.message}`);
         });
 
         socket.on('close', () => {
             this.clearTrackedTimer(hardTimer);
-            this.clearTrackedTimer(stallTimer);
+            this.clearTrackedTimer(wakeRetryTimer);
             if (this.activeSocket === socket) {
                 this.activeSocket = null;
             }
 
-            // Wenn die Antwort bei 18/23 Zeichen gestockt ist -> 1x automatisch nach 500 ms wiederholen!
-            if (stalledShortRead && !isRetry && !this.unloaded) {
-                this.later(() => {
-                    this.executeRead(cmd, isCompleteFn, parseFn, doneCallback, true);
-                }, 500);
-                return;
-            }
-
             if (hadError || timedOut) {
-                // Falls 0 oder wenige Bytes beim ersten Versuch im 6-Minuten-Takt -> 1x still wiederholen
-                if (timedOut && !isRetry && !this.unloaded) {
-                    this.log.debug(`${cmd}: Wiederhole Abfrage einmalig nach Timeout...`);
-                    this.later(() => {
-                        this.executeRead(cmd, isCompleteFn, parseFn, doneCallback, true);
-                    }, 500);
-                    return;
-                }
-
                 void this.setState('info.connection', false, true);
                 if (timedOut && this.pollQueue.length > 0) {
                     this.log.debug(
@@ -434,7 +442,7 @@ export class Luxtronik1 extends utils.Adapter {
                     const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
                     this.errorCounters[cmd] = (this.errorCounters[cmd] ?? 0) + 1;
                     this.log.warn(
-                        `Datensatz ${cmd} unvollständig/ungültig (Fehler #${this.errorCounters[cmd]}, Rohdaten: "${preview}")`
+                        `[v0.5.3] Datensatz ${cmd} unvollständig (Fehler #${this.errorCounters[cmd]}, Rohdaten: "${preview}")`
                     );
                     if (this.errorCounters[cmd] > 4) {
                         this.resetConnectionState(`Mehrfach unvollständiger Datensatz ${cmd}`);
@@ -473,7 +481,7 @@ export class Luxtronik1 extends utils.Adapter {
 
         const hardTimer = this.later(() => {
             if (!socket.destroyed) {
-                this.log.warn(`${cmd} (Write): Hard-Timeout erreicht, Verbindung wird geschlossen`);
+                this.log.warn(`[v0.5.3] ${cmd} (Write): Hard-Timeout erreicht, Verbindung wird geschlossen`);
                 socket.destroy();
             }
         }, idleTimeout * 3);
@@ -485,7 +493,7 @@ export class Luxtronik1 extends utils.Adapter {
         };
 
         socket.on('connect', () => {
-            this.log.info(`${cmd}: Sende Schreibbefehl an Luxtronik: ${payloadLine}`);
+            this.log.info(`[v0.5.3] ${cmd}: Sende Schreibbefehl an Luxtronik: ${payloadLine}`);
             safeWrite(`${cmd}\r\n`);
             stepTimer1 = this.later(() => {
                 if (!recoveryTriggered) {
@@ -499,9 +507,9 @@ export class Luxtronik1 extends utils.Adapter {
                         if (!socket.destroyed) {
                             const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
                             this.log.debug(
-                                `${cmd}: Schreibsequenz beendet (${rxBuffer.length} Bytes: "${preview}"), schließe Socket`
+                                `[v0.5.3] ${cmd}: Schreibsequenz beendet (${rxBuffer.length} Bytes: "${preview}"), schließe Socket`
                             );
-                            socket.destroy();
+                            this.closeSocketGracefully(socket);
                         }
                     }, 1200);
                 }
@@ -516,15 +524,13 @@ export class Luxtronik1 extends utils.Adapter {
                     this.clearTrackedTimer(stepTimer1);
                     this.clearTrackedTimer(stepTimer2);
                     this.clearTrackedTimer(closeAfterWriteTimer);
-                    this.log.warn(`${cmd}: Kommunikationsstörung (779) erkannt, führe Reset-Sequenz aus...`);
+                    this.log.warn(`[v0.5.3] ${cmd}: Kommunikationsstörung (779) erkannt, führe Reset-Sequenz aus...`);
 
                     this.later(() => safeWrite(`${cmd}\r\n`), 300);
                     this.later(() => safeWrite(`${cmd};0\r\n`), 1000);
                     this.later(() => safeWrite('999\r\n'), 1800);
                     this.later(() => {
-                        if (!socket.destroyed) {
-                            socket.destroy();
-                        }
+                        this.closeSocketGracefully(socket);
                     }, 2500);
                     return;
                 }
@@ -536,7 +542,7 @@ export class Luxtronik1 extends utils.Adapter {
                     rxBuffer.endsWith('999\n')
                 ) {
                     this.clearTrackedTimer(closeAfterWriteTimer);
-                    socket.destroy();
+                    this.closeSocketGracefully(socket);
                 }
             } catch (e) {
                 this.log.debug(`${cmd}: Fehler bei Störungsbehebung: ${String(e)}`);
@@ -545,12 +551,12 @@ export class Luxtronik1 extends utils.Adapter {
 
         socket.on('timeout', () => {
             const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-            this.log.warn(`${cmd} (Write): Timeout nach ${idleTimeout} ms (Rohdaten: "${preview}")`);
+            this.log.warn(`[v0.5.3] ${cmd} (Write): Timeout nach ${idleTimeout} ms (Rohdaten: "${preview}")`);
             socket.destroy();
         });
 
         socket.on('error', (err: Error) => {
-            this.log.warn(`${cmd} (Write) Socket-Fehler: ${err.message}`);
+            this.log.warn(`[v0.5.3] ${cmd} (Write) Socket-Fehler: ${err.message}`);
         });
 
         socket.on('close', () => {
@@ -568,7 +574,7 @@ export class Luxtronik1 extends utils.Adapter {
                         await onCloseParseFn(rxBuffer.trim());
                     } else if (recoveryTriggered) {
                         this.log.warn(
-                            `${cmd}: Editiermodus wurde nach Fehler 779 zurückgesetzt. Befehl wird erneut eingereiht.`
+                            `[v0.5.3] ${cmd}: Editiermodus wurde nach Fehler 779 zurückgesetzt. Befehl wird erneut eingereiht.`
                         );
                         this.later(() => {
                             this.enqueueCommand(`write_${cmd}_retry`, (cb) =>
