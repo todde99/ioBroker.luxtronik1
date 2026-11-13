@@ -129,7 +129,7 @@ export class Luxtronik1 extends utils.Adapter {
 
         const pollingTime = Math.max(Number(this.config.pollInterval) || 300000, 10000);
         this.log.info(
-            `[START] Luxtronik-Adapter v0.5.1 gestartet (${this.deviceIpAddress}:${this.port}, Intervall: ${pollingTime} ms)`
+            `[START] Luxtronik-Adapter v0.5.2 gestartet (${this.deviceIpAddress}:${this.port}, Intervall: ${pollingTime} ms)`
         );
 
         this.subscribeStates('control.*');
@@ -248,6 +248,7 @@ export class Luxtronik1 extends utils.Adapter {
         }
 
         this.isProcessingQueue = true;
+        // 2500 ms Pause nach Schreibbefehlen (EEPROM-Speicherung), sonst 500 ms
         const delayAfterMs = nextItem.name.startsWith('write_') ? 2500 : 500;
 
         try {
@@ -291,7 +292,8 @@ export class Luxtronik1 extends utils.Adapter {
         cmd: string,
         isCompleteFn: (buf: string) => boolean,
         parseFn: (raw: string) => Promise<boolean> | boolean,
-        doneCallback: (success?: boolean) => void
+        doneCallback: (success?: boolean) => void,
+        isRetry = false
     ): void {
         if (this.unloaded) {
             doneCallback(false);
@@ -302,8 +304,8 @@ export class Luxtronik1 extends utils.Adapter {
         let timedOut = false;
         let hadError = false;
         let connected = false;
-        let recoveryTriggered = false;
-        let finishDebounceTimer: ioBroker.Timeout | undefined;
+        let stalledShortRead = false;
+        let stallTimer: ioBroker.Timeout | undefined;
 
         const idleTimeout = Number(this.config.socketTimeout) || 15000;
         const socket = new net.Socket();
@@ -313,7 +315,7 @@ export class Luxtronik1 extends utils.Adapter {
 
         const hardTimer = this.later(() => {
             if (!socket.destroyed) {
-                this.log.warn(`${cmd}: Anfrage dauert zu lange (Hard-Timeout), Verbindung wird geschlossen`);
+                this.log.warn(`${cmd}: Hard-Timeout erreicht, Verbindung wird geschlossen`);
                 timedOut = true;
                 socket.destroy();
             }
@@ -322,49 +324,41 @@ export class Luxtronik1 extends utils.Adapter {
         socket.on('connect', () => {
             connected = true;
             this.log.debug(`${cmd}: Verbunden mit Luxtronik`);
-            this.later(() => {
-                if (!socket.destroyed && socket.writable) {
-                    socket.write(`${cmd}\r\n`);
-                }
-            }, 100);
+            // Wie im Original sofort synchron nach dem Connect senden!
+            socket.write(`${cmd}\r\n`);
         });
 
         socket.on('data', (chunk: Buffer) => {
             rxBuffer += chunk.toString('utf8');
-            this.clearTrackedTimer(finishDebounceTimer);
+            this.clearTrackedTimer(stallTimer);
 
             try {
-                // Falls die Luxtronik im Editiermodus (779/777) hängt, sofort mit 999 befreien
-                if ((rxBuffer.includes('779') || rxBuffer.includes('777')) && !recoveryTriggered) {
-                    recoveryTriggered = true;
-                    const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-                    this.log.warn(`${cmd}: Offener Editiermodus erkannt ("${preview}"), sende 999...`);
-                    if (!socket.destroyed && socket.writable) {
-                        socket.write('999\r\n');
-                    }
-                    this.later(() => {
-                        if (!socket.destroyed) {
-                            socket.destroy();
-                        }
-                    }, 800);
+                if (isCompleteFn(rxBuffer)) {
+                    this.log.debug(`${cmd}: Daten vollständig empfangen (${rxBuffer.length} Zeichen)`);
+                    socket.destroy();
                     return;
                 }
 
-                if (isCompleteFn(rxBuffer)) {
-                    // Falls schon mit \r oder \n abgeschlossen -> sofort schließen,
-                    // sonst 150 ms warten, falls das letzte Zeichen mehrstellig ist (z.B. "-10")
-                    if (rxBuffer.endsWith('\n') || rxBuffer.endsWith('\r')) {
-                        this.log.debug(`${cmd}: Daten vollständig empfangen (${rxBuffer.length} Bytes)`);
-                        socket.destroy();
-                    } else {
-                        finishDebounceTimer = this.later(() => {
+                // Wenn Daten begonnen haben (z. B. 18 oder 23 Zeichen Echo/Fehlercode), aber nach 1800 ms
+                // nichts mehr nachkommt, hängt die Luxtronik im Editiermodus oder hat den Befehl verschluckt:
+                // Nicht 15s warten, sondern 999 senden, schließen und 1x sofort wiederholen!
+                stallTimer = this.later(() => {
+                    if (!socket.destroyed && !isCompleteFn(rxBuffer)) {
+                        stalledShortRead = true;
+                        const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+                        this.log.debug(
+                            `${cmd}: Antwort nach ${rxBuffer.length} Zeichen gestockt ("${preview}"), sende Reset (999) und wiederhole...`
+                        );
+                        if (socket.writable) {
+                            socket.write('999\r\n');
+                        }
+                        this.later(() => {
                             if (!socket.destroyed) {
-                                this.log.debug(`${cmd}: Daten vollständig (Debounce, ${rxBuffer.length} Bytes)`);
                                 socket.destroy();
                             }
-                        }, 150);
+                        }, 400);
                     }
-                }
+                }, 1800);
             } catch (e) {
                 this.log.warn(`${cmd}: Fehler bei Vollständigkeitsprüfung: ${String(e)}`);
             }
@@ -390,17 +384,29 @@ export class Luxtronik1 extends utils.Adapter {
 
         socket.on('close', () => {
             this.clearTrackedTimer(hardTimer);
-            this.clearTrackedTimer(finishDebounceTimer);
+            this.clearTrackedTimer(stallTimer);
             if (this.activeSocket === socket) {
                 this.activeSocket = null;
             }
 
-            if (recoveryTriggered) {
-                doneCallback(false);
+            // Wenn die Antwort bei 18/23 Zeichen gestockt ist -> 1x automatisch nach 500 ms wiederholen!
+            if (stalledShortRead && !isRetry && !this.unloaded) {
+                this.later(() => {
+                    this.executeRead(cmd, isCompleteFn, parseFn, doneCallback, true);
+                }, 500);
                 return;
             }
 
             if (hadError || timedOut) {
+                // Falls 0 oder wenige Bytes beim ersten Versuch im 6-Minuten-Takt -> 1x still wiederholen
+                if (timedOut && !isRetry && !this.unloaded) {
+                    this.log.debug(`${cmd}: Wiederhole Abfrage einmalig nach Timeout...`);
+                    this.later(() => {
+                        this.executeRead(cmd, isCompleteFn, parseFn, doneCallback, true);
+                    }, 500);
+                    return;
+                }
+
                 void this.setState('info.connection', false, true);
                 if (timedOut && this.pollQueue.length > 0) {
                     this.log.debug(
@@ -480,12 +486,12 @@ export class Luxtronik1 extends utils.Adapter {
 
         socket.on('connect', () => {
             this.log.info(`${cmd}: Sende Schreibbefehl an Luxtronik: ${payloadLine}`);
-            this.later(() => safeWrite(`${cmd}\r\n`), 100);
+            safeWrite(`${cmd}\r\n`);
             stepTimer1 = this.later(() => {
                 if (!recoveryTriggered) {
                     safeWrite(`${payloadLine}\r\n`);
                 }
-            }, 1500);
+            }, 2000);
             stepTimer2 = this.later(() => {
                 if (!recoveryTriggered) {
                     safeWrite('999\r\n');
@@ -497,9 +503,9 @@ export class Luxtronik1 extends utils.Adapter {
                             );
                             socket.destroy();
                         }
-                    }, 1000);
+                    }, 1200);
                 }
-            }, 3000);
+            }, 4000);
         });
 
         socket.on('data', (chunk: Buffer) => {
