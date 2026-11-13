@@ -1,8 +1,21 @@
 {
   "common": {
     "name": "luxtronik1",
-    "version": "0.5.6",
+    "version": "0.6.0",
     "news": {
+      "0.6.0": {
+        "en": "Migrated adapter to TypeScript\nImplemented Single-Socket-Mode for reliable RS232-LAN converter communication\nReplaced Materialize admin UI with modern jsonConfig",
+        "de": "Adapter auf TypeScript umgestellt\nSingle-Socket-Modus für zuverlässige RS232-LAN-Konverter-Kommunikation implementiert\nAdmin-Oberfläche von Materialize auf moderne jsonConfig umgestellt",
+        "ru": "Адаптер переведен на TypeScript\nРеализован режим одного сокета для надежной связи с конвертером RS232-LAN\nИнтерфейс администратора переведен с Materialize на jsonConfig",
+        "pt": "Adaptador migrado para TypeScript\nModo de soquete único implementado para comunicação confiável via conversor RS232-LAN\nInterface de administração alterada de Materialize para jsonConfig",
+        "nl": "Adapter gemigreerd naar TypeScript\nSingle-Socket-modus geïmplementeerd voor betrouwbare RS232-LAN-convertercommunicatie\nMaterialize-beheerinterface vervangen door moderne jsonConfig",
+        "fr": "Migration de l'adaptateur vers TypeScript\nMode socket unique implémenté pour une communication fiable avec le convertisseur RS232-LAN\nInterface d'administration Materialize remplacée par jsonConfig",
+        "it": "Adattatore migrato a TypeScript\nImplementata la modalità Single-Socket per una comunicazione affidabile con il convertitore RS232-LAN\nInterfaccia di amministrazione sostituita con jsonConfig",
+        "es": "Adaptador migrado a TypeScript\nModo de socket único implementado para una comunicación fiable con el convertidor RS232-LAN\nInterfaz de administración Materialize reemplazada por jsonConfig",
+        "pl": "Migracja adaptera do TypeScript\nWdrożono tryb pojedynczego gniazda dla niezawodnej komunikacji z konwerterem RS232-LAN\nZastąpiono interfejs Materialize nowoczesnym jsonConfig",
+        "uk": "Адаптер переведено на TypeScript\nРеалізовано режим одного сокета для надійного зв'язку з конвертером RS232-LAN\nІнтерфейс адміністратора змінено з Materialize на jsonConfig",
+        "zh-cn": "将适配器迁移到 TypeScript\n实现单套接字模式以确保可靠的 RS232-LAN 转换器通信\n将 Materialize 管理界面替换为现代 jsonConfig"
+      },
       "0.5.0": {
         "en": "Migrated adapter to TypeScript\nHardened RS232 socket communication and priority command queue\nReplaced Materialize admin UI with modern jsonConfig",
         "de": "Adapter auf TypeScript umgestellt\nRS232-Socket-Kommunikation und Prioritäts-Warteschlange gehärtet\nAdmin-Oberfläche von Materialize auf moderne jsonConfig umgestellt",
