@@ -82,7 +82,8 @@ export class Luxtronik1 extends utils.Adapter {
     private pollingTimer: ioBroker.Interval | null | undefined = null;
     private unloaded = false;
 
-    private activeSocket: net.Socket | null = null;
+    // Gemeinsamer Socket für einen kompletten Queue-Durchlauf (verhindert Socket-Erschöpfung am RS232-Konverter)
+    private sharedSocket: net.Socket | null = null;
     private isProcessingQueue = false;
     private schaltzbwblock = false;
     private zeitblock = false;
@@ -129,7 +130,7 @@ export class Luxtronik1 extends utils.Adapter {
 
         const pollingTime = Math.max(Number(this.config.pollInterval) || 300000, 10000);
         this.log.info(
-            `[START] Luxtronik-Adapter v0.5.3 gestartet (${this.deviceIpAddress}:${this.port}, Intervall: ${pollingTime} ms)`
+            `[START] Luxtronik-Adapter v0.5.5 (Single-Socket-Mode) gestartet (${this.deviceIpAddress}:${this.port}, Intervall: ${pollingTime} ms)`
         );
 
         this.subscribeStates('control.*');
@@ -190,20 +191,92 @@ export class Luxtronik1 extends utils.Adapter {
         }
     }
 
-    private closeSocketGracefully(socket: net.Socket): void {
-        if (socket.destroyed) {
+    // Baut eine Verbindung auf oder gibt die bereits offene Verbindung zurück
+    private getOrConnectSocket(callback: (err: Error | null, socket: net.Socket | null) => void): void {
+        if (this.unloaded) {
+            callback(new Error('Adapter unloaded'), null);
             return;
         }
+
+        if (this.sharedSocket && !this.sharedSocket.destroyed && this.sharedSocket.writable) {
+            this.sharedSocket.removeAllListeners('data');
+            this.sharedSocket.removeAllListeners('timeout');
+            this.sharedSocket.removeAllListeners('error');
+            this.sharedSocket.removeAllListeners('close');
+            this.sharedSocket.on('error', () => {
+                /* prevent unhandled error while idle */
+            });
+            callback(null, this.sharedSocket);
+            return;
+        }
+
+        this.closeSharedSocket();
+
+        const connectTimeout = Number(this.config.socketTimeout) || 15000;
+        const socket = new net.Socket();
+        socket.setNoDelay(true);
+        socket.setKeepAlive(true, 5000);
+        this.sharedSocket = socket;
+
+        let settled = false;
+        const connTimer = this.later(() => {
+            if (!settled) {
+                settled = true;
+                socket.destroy();
+                this.sharedSocket = null;
+                callback(new Error(`Connect-Timeout (${connectTimeout} ms)`), null);
+            }
+        }, connectTimeout);
+
+        socket.once('connect', () => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            this.clearTrackedTimer(connTimer);
+            this.log.debug('[v0.5.5] TCP-Verbindung zum RS232-Konverter hergestellt');
+            // Nach frischem TCP-Connect 150 ms warten, bis UART bereit ist
+            this.later(() => {
+                callback(null, socket);
+            }, 150);
+        });
+
+        socket.once('error', (err: Error) => {
+            if (settled) {
+                return;
+            }
+            settled = true;
+            this.clearTrackedTimer(connTimer);
+            socket.destroy();
+            if (this.sharedSocket === socket) {
+                this.sharedSocket = null;
+            }
+            callback(err, null);
+        });
+
+        socket.connect(this.port, this.deviceIpAddress);
+    }
+
+    private closeSharedSocket(): void {
+        if (!this.sharedSocket) {
+            return;
+        }
+        const s = this.sharedSocket;
+        this.sharedSocket = null;
         try {
-            socket.end();
+            s.removeAllListeners();
+            s.on('error', () => {
+                /* ignore */
+            });
+            s.end();
+            this.later(() => {
+                if (!s.destroyed) {
+                    s.destroy();
+                }
+            }, 150);
         } catch {
             /* ignore */
         }
-        this.later(() => {
-            if (!socket.destroyed) {
-                socket.destroy();
-            }
-        }, 150);
     }
 
     private shutdown(): void {
@@ -217,28 +290,17 @@ export class Luxtronik1 extends utils.Adapter {
         this.pollQueue = [];
         this.commandQueue = [];
         this.isProcessingQueue = false;
-
-        if (this.activeSocket) {
-            try {
-                this.activeSocket.removeAllListeners();
-                this.activeSocket.on('error', () => {
-                    /* ignore */
-                });
-                this.activeSocket.destroy();
-            } catch {
-                /* ignore */
-            }
-            this.activeSocket = null;
-        }
+        this.closeSharedSocket();
     }
 
     private resetConnectionState(reason: string): void {
-        this.log.warn(`Verbindung zur Luxtronik wird zurückgesetzt (${reason})`);
+        this.log.warn(`[v0.5.5] Verbindung zur Luxtronik wird zurückgesetzt (${reason})`);
         this.pollQueue = [];
         this.currentPollCycleActive = false;
         for (const key of Object.keys(this.errorCounters)) {
             this.errorCounters[key] = 0;
         }
+        this.closeSharedSocket();
         void this.setState('info.connection', false, true);
     }
 
@@ -253,19 +315,21 @@ export class Luxtronik1 extends utils.Adapter {
     }
 
     private processQueues(): void {
-        if (this.unloaded || this.isProcessingQueue || this.activeSocket) {
+        if (this.unloaded || this.isProcessingQueue) {
             return;
         }
 
         const nextItem = this.commandQueue.shift() ?? this.pollQueue.shift();
         if (!nextItem) {
             this.currentPollCycleActive = false;
+            // Alle Befehle der Queue abgearbeitet -> gemeinsame TCP-Verbindung sauber schließen!
+            this.closeSharedSocket();
             return;
         }
 
         this.isProcessingQueue = true;
-        // Nach einem Schreibbefehl 2500 ms Pause (EEPROM), zwischen Leseabfragen 600 ms Pause für den Konverter
-        const delayAfterMs = nextItem.name.startsWith('write_') ? 2500 : 600;
+        // Nach einem Schreibbefehl 2500 ms Pause für das EEPROM, zwischen Lese-Befehlen auf derselben Leitung 250 ms
+        const delayAfterMs = nextItem.name.startsWith('write_') ? 2500 : 250;
 
         try {
             void nextItem.taskFn(() => {
@@ -275,7 +339,8 @@ export class Luxtronik1 extends utils.Adapter {
         } catch (e) {
             this.log.warn(`Fehler bei Ausführung von ${nextItem.name}: ${String(e)}`);
             this.isProcessingQueue = false;
-            this.later(() => this.processQueues(), 600);
+            this.closeSharedSocket();
+            this.later(() => this.processQueues(), 500);
         }
     }
 
@@ -315,145 +380,134 @@ export class Luxtronik1 extends utils.Adapter {
             return;
         }
 
-        let rxBuffer = '';
-        let timedOut = false;
-        let hadError = false;
-        let connected = false;
-        let retransmitDone = false;
-        let wakeRetryTimer: ioBroker.Timeout | undefined;
-
-        const idleTimeout = Number(this.config.socketTimeout) || 15000;
-        const socket = new net.Socket();
-        this.activeSocket = socket;
-
-        socket.setTimeout(idleTimeout);
-
-        const hardTimer = this.later(() => {
-            if (!socket.destroyed) {
-                this.log.warn(`[v0.5.3] ${cmd}: Hard-Timeout erreicht, Verbindung wird geschlossen`);
-                timedOut = true;
-                socket.destroy();
-            }
-        }, idleTimeout * 3);
-
-        // Falls nach 2,5 Sekunden 0 Zeichen oder nur ein kurzes Echo (18/23 Zeichen) kamen:
-        // Auf demselben offenen Socket 999\r\n (Reset Editiermodus) und danach den Befehl erneut senden!
-        const scheduleWakeRetransmit = (): void => {
-            this.clearTrackedTimer(wakeRetryTimer);
-            if (retransmitDone) {
-                return;
-            }
-            wakeRetryTimer = this.later(() => {
-                if (!socket.destroyed && socket.writable && !isCompleteFn(rxBuffer)) {
-                    retransmitDone = true;
-                    const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-                    this.log.debug(
-                        `[v0.5.3] ${cmd}: Nach 2500 ms erst ${rxBuffer.length} Bytes ("${preview}"), sende Wake-up & Retransmit auf offener Verbindung...`
-                    );
-                    rxBuffer = '';
-                    socket.write('999\r\n');
-                    this.later(() => {
-                        if (!socket.destroyed && socket.writable) {
-                            rxBuffer = '';
-                            socket.write(`${cmd}\r\n`);
-                        }
-                    }, 400);
-                }
-            }, 2500);
-        };
-
-        socket.on('connect', () => {
-            connected = true;
-            this.log.debug(`[v0.5.3] ${cmd}: Verbunden mit Luxtronik`);
-            socket.write(`${cmd}\r\n`);
-            scheduleWakeRetransmit();
-        });
-
-        socket.on('data', (chunk: Buffer) => {
-            rxBuffer += chunk.toString('utf8');
-
-            try {
-                if (isCompleteFn(rxBuffer)) {
-                    this.clearTrackedTimer(wakeRetryTimer);
-                    this.log.debug(`[v0.5.3] ${cmd}: Daten vollständig (${rxBuffer.length} Bytes)`);
-                    this.closeSocketGracefully(socket);
-                    return;
-                }
-
-                // Falls noch unvollständig (z. B. erst 18 oder 23 Bytes Echo/779), Timer neu starten
-                scheduleWakeRetransmit();
-            } catch (e) {
-                this.log.warn(`[v0.5.3] ${cmd}: Fehler bei Vollständigkeitsprüfung: ${String(e)}`);
-            }
-        });
-
-        socket.on('timeout', () => {
-            timedOut = true;
-            const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-            if (connected) {
-                this.log.warn(
-                    `[v0.5.3] ${cmd}: Timeout nach ${idleTimeout} ms (${rxBuffer.length} Bytes, Rohdaten: "${preview}")`
-                );
-            } else {
-                this.log.warn(
-                    `[v0.5.3] ${cmd}: Keine Verbindung zum RS232-Konverter möglich (Timeout ${idleTimeout} ms)`
-                );
-            }
-            socket.destroy();
-        });
-
-        socket.on('error', (err: Error) => {
-            hadError = true;
-            this.log.warn(`[v0.5.3] ${cmd} Socket-Fehler: ${err.message}`);
-        });
-
-        socket.on('close', () => {
-            this.clearTrackedTimer(hardTimer);
-            this.clearTrackedTimer(wakeRetryTimer);
-            if (this.activeSocket === socket) {
-                this.activeSocket = null;
-            }
-
-            if (hadError || timedOut) {
+        this.getOrConnectSocket((connErr, socket) => {
+            if (connErr || !socket) {
+                this.log.warn(`[v0.5.5] ${cmd}: Verbindungsfehler: ${connErr?.message ?? 'Kein Socket'}`);
                 void this.setState('info.connection', false, true);
-                if (timedOut && this.pollQueue.length > 0) {
-                    this.log.debug(
-                        `Abfragezyklus wegen Timeout abgebrochen (${this.pollQueue.length} Abfragen übersprungen)`
-                    );
-                    this.pollQueue = [];
-                    this.currentPollCycleActive = false;
-                }
+                this.pollQueue = [];
+                this.currentPollCycleActive = false;
                 doneCallback(false);
                 return;
             }
 
-            void (async () => {
-                let success = false;
-                try {
-                    success = await parseFn(rxBuffer.trim());
-                } catch (e) {
-                    this.log.warn(`callluxtronik${cmd} - Parse-Fehler: ${String(e)}`);
-                    success = false;
+            let rxBuffer = '';
+            let finished = false;
+            let retransmitDone = false;
+            let wakeRetryTimer: ioBroker.Timeout | undefined;
+
+            const idleTimeout = Number(this.config.socketTimeout) || 15000;
+
+            const finishStep = (ok: boolean, destroySocket: boolean): void => {
+                if (finished) {
+                    return;
+                }
+                finished = true;
+                this.clearTrackedTimer(timeoutTimer);
+                this.clearTrackedTimer(wakeRetryTimer);
+
+                socket.removeAllListeners('data');
+                socket.removeAllListeners('error');
+                socket.removeAllListeners('close');
+                socket.on('error', () => {
+                    /* ignore while idle */
+                });
+
+                if (destroySocket) {
+                    this.closeSharedSocket();
                 }
 
-                if (success) {
-                    this.errorCounters[cmd] = 0;
-                } else {
-                    const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-                    this.errorCounters[cmd] = (this.errorCounters[cmd] ?? 0) + 1;
-                    this.log.warn(
-                        `[v0.5.3] Datensatz ${cmd} unvollständig (Fehler #${this.errorCounters[cmd]}, Rohdaten: "${preview}")`
-                    );
-                    if (this.errorCounters[cmd] > 4) {
-                        this.resetConnectionState(`Mehrfach unvollständiger Datensatz ${cmd}`);
+                if (!ok) {
+                    doneCallback(false);
+                    return;
+                }
+
+                void (async () => {
+                    let success = false;
+                    try {
+                        success = await parseFn(rxBuffer.trim());
+                    } catch (e) {
+                        this.log.warn(`[v0.5.5] ${cmd} Parse-Fehler: ${String(e)}`);
+                        success = false;
                     }
+
+                    if (success) {
+                        this.errorCounters[cmd] = 0;
+                    } else {
+                        const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+                        this.errorCounters[cmd] = (this.errorCounters[cmd] ?? 0) + 1;
+                        this.log.warn(
+                            `[v0.5.5] Datensatz ${cmd} unvollständig (Fehler #${this.errorCounters[cmd]}, Rohdaten: "${preview}")`
+                        );
+                        if (this.errorCounters[cmd] > 4) {
+                            this.resetConnectionState(`Mehrfach unvollständiger Datensatz ${cmd}`);
+                        }
+                    }
+                    doneCallback(success);
+                })();
+            };
+
+            const timeoutTimer = this.later(() => {
+                const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+                this.log.warn(
+                    `[v0.5.5] ${cmd}: Timeout nach ${idleTimeout} ms (${rxBuffer.length} Bytes, Rohdaten: "${preview}")`
+                );
+                void this.setState('info.connection', false, true);
+                finishStep(false, true);
+            }, idleTimeout);
+
+            const scheduleWakeRetransmit = (): void => {
+                this.clearTrackedTimer(wakeRetryTimer);
+                if (retransmitDone || finished) {
+                    return;
                 }
+                wakeRetryTimer = this.later(() => {
+                    if (!finished && !socket.destroyed && socket.writable && !isCompleteFn(rxBuffer)) {
+                        retransmitDone = true;
+                        const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+                        this.log.debug(
+                            `[v0.5.5] ${cmd}: Nach 2000 ms erst ${rxBuffer.length} Bytes ("${preview}"), sende 999 & Retransmit...`
+                        );
+                        rxBuffer = '';
+                        socket.write('999\r\n');
+                        this.later(() => {
+                            if (!finished && !socket.destroyed && socket.writable) {
+                                rxBuffer = '';
+                                socket.write(`${cmd}\r\n`);
+                            }
+                        }, 350);
+                    }
+                }, 2000);
+            };
 
-                doneCallback(success);
-            })();
+            socket.on('data', (chunk: Buffer) => {
+                rxBuffer += chunk.toString('utf8');
+                try {
+                    if (isCompleteFn(rxBuffer)) {
+                        this.log.debug(`[v0.5.5] ${cmd}: OK (${rxBuffer.length} Bytes)`);
+                        finishStep(true, false);
+                        return;
+                    }
+                    scheduleWakeRetransmit();
+                } catch (e) {
+                    this.log.warn(`[v0.5.5] ${cmd}: Fehler bei Prüfung: ${String(e)}`);
+                }
+            });
+
+            socket.once('error', (err: Error) => {
+                this.log.warn(`[v0.5.5] ${cmd} Socket-Fehler: ${err.message}`);
+                finishStep(false, true);
+            });
+
+            socket.once('close', () => {
+                if (!finished) {
+                    this.sharedSocket = null;
+                    finishStep(isCompleteFn(rxBuffer), true);
+                }
+            });
+
+            socket.write(`${cmd}\r\n`);
+            scheduleWakeRetransmit();
         });
-
-        socket.connect(this.port, this.deviceIpAddress);
     }
 
     private executeWrite(
@@ -467,131 +521,130 @@ export class Luxtronik1 extends utils.Adapter {
             return;
         }
 
-        let rxBuffer = '';
-        let recoveryTriggered = false;
-        let stepTimer1: ioBroker.Timeout | undefined;
-        let stepTimer2: ioBroker.Timeout | undefined;
-        let closeAfterWriteTimer: ioBroker.Timeout | undefined;
-
-        const idleTimeout = Number(this.config.socketTimeout) || 15000;
-        const socket = new net.Socket();
-        this.activeSocket = socket;
-
-        socket.setTimeout(idleTimeout);
-
-        const hardTimer = this.later(() => {
-            if (!socket.destroyed) {
-                this.log.warn(`[v0.5.3] ${cmd} (Write): Hard-Timeout erreicht, Verbindung wird geschlossen`);
-                socket.destroy();
+        this.getOrConnectSocket((connErr, socket) => {
+            if (connErr || !socket) {
+                this.log.warn(`[v0.5.5] ${cmd} (Write): Verbindungsfehler: ${connErr?.message ?? 'Kein Socket'}`);
+                doneCallback(false);
+                return;
             }
-        }, idleTimeout * 3);
 
-        const safeWrite = (str: string): void => {
-            if (!socket.destroyed && socket.writable) {
-                socket.write(str);
-            }
-        };
+            let rxBuffer = '';
+            let finished = false;
+            let recoveryTriggered = false;
+            let stepTimer1: ioBroker.Timeout | undefined;
+            let stepTimer2: ioBroker.Timeout | undefined;
+            let closeAfterWriteTimer: ioBroker.Timeout | undefined;
 
-        socket.on('connect', () => {
-            this.log.info(`[v0.5.3] ${cmd}: Sende Schreibbefehl an Luxtronik: ${payloadLine}`);
+            const idleTimeout = Number(this.config.socketTimeout) || 15000;
+
+            const safeWrite = (str: string): void => {
+                if (!finished && !socket.destroyed && socket.writable) {
+                    socket.write(str);
+                }
+            };
+
+            const finishWrite = (): void => {
+                if (finished) {
+                    return;
+                }
+                finished = true;
+                this.clearTrackedTimer(timeoutTimer);
+                this.clearTrackedTimer(stepTimer1);
+                this.clearTrackedTimer(stepTimer2);
+                this.clearTrackedTimer(closeAfterWriteTimer);
+
+                socket.removeAllListeners('data');
+                socket.removeAllListeners('error');
+                socket.removeAllListeners('close');
+                socket.on('error', () => {
+                    /* ignore */
+                });
+
+                void (async () => {
+                    try {
+                        if (rxBuffer !== '' && !recoveryTriggered && onCloseParseFn) {
+                            await onCloseParseFn(rxBuffer.trim());
+                        } else if (recoveryTriggered) {
+                            this.log.warn(
+                                `[v0.5.5] ${cmd}: Editiermodus nach 779 zurückgesetzt, wiederhole Schreibbefehl...`
+                            );
+                            this.later(() => {
+                                this.enqueueCommand(`write_${cmd}_retry`, (cb) =>
+                                    this.executeWrite(cmd, payloadLine, onCloseParseFn, cb)
+                                );
+                            }, 1500);
+                        }
+                    } catch (e) {
+                        this.log.warn(`[v0.5.5] ${cmd} Write-Parse-Fehler: ${String(e)}`);
+                    }
+                    doneCallback(!recoveryTriggered);
+                })();
+            };
+
+            const timeoutTimer = this.later(() => {
+                const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+                this.log.warn(`[v0.5.5] ${cmd} (Write): Timeout (${rxBuffer.length} Bytes, Rohdaten: "${preview}")`);
+                this.closeSharedSocket();
+                finishWrite();
+            }, idleTimeout);
+
+            socket.on('data', (chunk: Buffer) => {
+                rxBuffer += chunk.toString('utf8');
+                try {
+                    if (rxBuffer.includes('779') && !recoveryTriggered) {
+                        recoveryTriggered = true;
+                        this.clearTrackedTimer(stepTimer1);
+                        this.clearTrackedTimer(stepTimer2);
+                        this.clearTrackedTimer(closeAfterWriteTimer);
+                        this.log.warn(`[v0.5.5] ${cmd}: Fehler 779 erkannt, führe Reset-Sequenz aus...`);
+
+                        this.later(() => safeWrite(`${cmd}\r\n`), 300);
+                        this.later(() => safeWrite(`${cmd};0\r\n`), 1000);
+                        this.later(() => safeWrite('999\r\n'), 1800);
+                        this.later(() => finishWrite(), 2500);
+                        return;
+                    }
+
+                    if (
+                        rxBuffer.includes('993\r\n999') ||
+                        rxBuffer.includes('993\n999') ||
+                        rxBuffer.endsWith('999\r\n') ||
+                        rxBuffer.endsWith('999\n')
+                    ) {
+                        finishWrite();
+                    }
+                } catch (e) {
+                    this.log.debug(`${cmd}: Fehler bei Störungsbehebung: ${String(e)}`);
+                }
+            });
+
+            socket.once('error', (err: Error) => {
+                this.log.warn(`[v0.5.5] ${cmd} (Write) Socket-Fehler: ${err.message}`);
+                this.closeSharedSocket();
+                finishWrite();
+            });
+
+            socket.once('close', () => {
+                this.sharedSocket = null;
+                finishWrite();
+            });
+
+            this.log.info(`[v0.5.5] ${cmd}: Sende Schreibbefehl: ${payloadLine}`);
             safeWrite(`${cmd}\r\n`);
             stepTimer1 = this.later(() => {
                 if (!recoveryTriggered) {
                     safeWrite(`${payloadLine}\r\n`);
                 }
-            }, 2000);
+            }, 1500);
             stepTimer2 = this.later(() => {
                 if (!recoveryTriggered) {
                     safeWrite('999\r\n');
                     closeAfterWriteTimer = this.later(() => {
-                        if (!socket.destroyed) {
-                            const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-                            this.log.debug(
-                                `[v0.5.3] ${cmd}: Schreibsequenz beendet (${rxBuffer.length} Bytes: "${preview}"), schließe Socket`
-                            );
-                            this.closeSocketGracefully(socket);
-                        }
-                    }, 1200);
+                        finishWrite();
+                    }, 1000);
                 }
-            }, 4000);
+            }, 3000);
         });
-
-        socket.on('data', (chunk: Buffer) => {
-            rxBuffer += chunk.toString('utf8');
-            try {
-                if (rxBuffer.includes('779') && !recoveryTriggered) {
-                    recoveryTriggered = true;
-                    this.clearTrackedTimer(stepTimer1);
-                    this.clearTrackedTimer(stepTimer2);
-                    this.clearTrackedTimer(closeAfterWriteTimer);
-                    this.log.warn(`[v0.5.3] ${cmd}: Kommunikationsstörung (779) erkannt, führe Reset-Sequenz aus...`);
-
-                    this.later(() => safeWrite(`${cmd}\r\n`), 300);
-                    this.later(() => safeWrite(`${cmd};0\r\n`), 1000);
-                    this.later(() => safeWrite('999\r\n'), 1800);
-                    this.later(() => {
-                        this.closeSocketGracefully(socket);
-                    }, 2500);
-                    return;
-                }
-
-                if (
-                    rxBuffer.includes('993\r\n999') ||
-                    rxBuffer.includes('993\n999') ||
-                    rxBuffer.endsWith('999\r\n') ||
-                    rxBuffer.endsWith('999\n')
-                ) {
-                    this.clearTrackedTimer(closeAfterWriteTimer);
-                    this.closeSocketGracefully(socket);
-                }
-            } catch (e) {
-                this.log.debug(`${cmd}: Fehler bei Störungsbehebung: ${String(e)}`);
-            }
-        });
-
-        socket.on('timeout', () => {
-            const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-            this.log.warn(`[v0.5.3] ${cmd} (Write): Timeout nach ${idleTimeout} ms (Rohdaten: "${preview}")`);
-            socket.destroy();
-        });
-
-        socket.on('error', (err: Error) => {
-            this.log.warn(`[v0.5.3] ${cmd} (Write) Socket-Fehler: ${err.message}`);
-        });
-
-        socket.on('close', () => {
-            this.clearTrackedTimer(hardTimer);
-            this.clearTrackedTimer(stepTimer1);
-            this.clearTrackedTimer(stepTimer2);
-            this.clearTrackedTimer(closeAfterWriteTimer);
-            if (this.activeSocket === socket) {
-                this.activeSocket = null;
-            }
-
-            void (async () => {
-                try {
-                    if (rxBuffer !== '' && !recoveryTriggered && onCloseParseFn) {
-                        await onCloseParseFn(rxBuffer.trim());
-                    } else if (recoveryTriggered) {
-                        this.log.warn(
-                            `[v0.5.3] ${cmd}: Editiermodus wurde nach Fehler 779 zurückgesetzt. Befehl wird erneut eingereiht.`
-                        );
-                        this.later(() => {
-                            this.enqueueCommand(`write_${cmd}_retry`, (cb) =>
-                                this.executeWrite(cmd, payloadLine, onCloseParseFn, cb)
-                            );
-                        }, 1500);
-                    }
-                } catch (e) {
-                    this.log.warn(`callluxtronik${cmd} - Fehler: ${String(e)}`);
-                }
-
-                this.log.debug(`Daten ${cmd} fertig verarbeitet.`);
-                doneCallback(!recoveryTriggered);
-            })();
-        });
-
-        socket.connect(this.port, this.deviceIpAddress);
     }
 
     private callLuxtronik1100(done: (success?: boolean) => void): void {
@@ -640,7 +693,7 @@ export class Luxtronik1 extends utils.Adapter {
     private callLuxtronik1800(done: (success?: boolean) => void): void {
         this.executeRead(
             '1800',
-            (buf) => buf.includes('1800;8', 10),
+            (buf) => buf.includes('1800;8', 10) && (buf.endsWith('\n') || buf.endsWith('\r')),
             async (raw) => {
                 if (raw.length <= 500) {
                     return false;
