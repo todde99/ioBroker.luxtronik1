@@ -1,6 +1,6 @@
 {
   "name": "iobroker.luxtronik1",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "Control your Luxtronik 1 heatpump controller",
   "author": "forelleblau <marceladam@gmx.ch>",
   "license": "MIT",
