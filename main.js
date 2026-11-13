@@ -110,8 +110,6 @@ export class Luxtronik1 extends utils.Adapter {
         this.on('unload', this.onUnload.bind(this));
     }
 
-    // --- Lifecycle-Methoden ---
-
     private async onReady(): Promise<void> {
         if (!this.config.host) {
             this.log.warn('[START] Keine IP-Adresse konfiguriert');
@@ -131,7 +129,7 @@ export class Luxtronik1 extends utils.Adapter {
 
         const pollingTime = Math.max(Number(this.config.pollInterval) || 300000, 10000);
         this.log.info(
-            `[START] Luxtronik-Adapter gestartet (${this.deviceIpAddress}:${this.port}, Intervall: ${pollingTime} ms)`
+            `[START] Luxtronik-Adapter v0.5.1 gestartet (${this.deviceIpAddress}:${this.port}, Intervall: ${pollingTime} ms)`
         );
 
         this.subscribeStates('control.*');
@@ -163,8 +161,6 @@ export class Luxtronik1 extends utils.Adapter {
         this.log.debug(`Steuerbefehl empfangen: ${shortId} = ${state.val}`);
         void this.controlLuxtronik(shortId, state.val);
     }
-
-    // --- Timer- & Shutdown-Management ---
 
     private later(fn: () => void, ms: number): ioBroker.Timeout | undefined {
         const t = this.setTimeout(() => {
@@ -230,8 +226,6 @@ export class Luxtronik1 extends utils.Adapter {
         void this.setState('info.connection', false, true);
     }
 
-    // --- Zentrale Queue-Steuerung ---
-
     private enqueueCommand(name: string, taskFn: QueueTaskFn): void {
         this.commandQueue.push({ name, taskFn });
         this.processQueues();
@@ -254,8 +248,6 @@ export class Luxtronik1 extends utils.Adapter {
         }
 
         this.isProcessingQueue = true;
-        // Nach einem Schreibbefehl (write_*) 2500 ms Pause für das Luxtronik-EEPROM einlegen,
-        // zwischen normalen Abfragen 500 ms Pause für den RS232-LAN-Konverter.
         const delayAfterMs = nextItem.name.startsWith('write_') ? 2500 : 500;
 
         try {
@@ -270,20 +262,20 @@ export class Luxtronik1 extends utils.Adapter {
         }
     }
 
-    // --- Hilfsfunktionen für Protokoll-Parsing ---
-
-    /**
-     * Sucht im Empfangspuffer nach der eigentlichen Datenzeile "<cmd>;<count>;..."
-     * und ignoriert dabei vorangestellte Echo-Zeilen wie "<cmd>\r\n".
-     */
     private extractDataParts(expectedCmd: string, buffer: string): string[] | null {
         const lines = buffer.split(/\r?\n/);
         for (const rawLine of lines) {
             const line = rawLine.trim();
-            if (line.startsWith(`${expectedCmd};`)) {
-                const parts = line.split(';');
+            const idx = line.indexOf(`${expectedCmd};`);
+            if (idx >= 0) {
+                const cleanLine = line.substring(idx);
+                const parts = cleanLine.split(';');
                 const expectedCount = parseInt(parts[1], 10);
-                if (!Number.isNaN(expectedCount) && parts.length === expectedCount + 2) {
+                if (
+                    !Number.isNaN(expectedCount) &&
+                    parts.length === expectedCount + 2 &&
+                    parts[parts.length - 1].length > 0
+                ) {
                     return parts;
                 }
             }
@@ -292,13 +284,8 @@ export class Luxtronik1 extends utils.Adapter {
     }
 
     private isSingleLineComplete(expectedCmd: string, buffer: string): boolean {
-        if (!buffer.endsWith('\n') && !buffer.endsWith('\r')) {
-            return false;
-        }
         return this.extractDataParts(expectedCmd, buffer) !== null;
     }
-
-    // --- Generische Socket-Kommunikation (Lesen & Schreiben) ---
 
     private executeRead(
         cmd: string,
@@ -316,6 +303,7 @@ export class Luxtronik1 extends utils.Adapter {
         let hadError = false;
         let connected = false;
         let recoveryTriggered = false;
+        let finishDebounceTimer: ioBroker.Timeout | undefined;
 
         const idleTimeout = Number(this.config.socketTimeout) || 15000;
         const socket = new net.Socket();
@@ -334,7 +322,6 @@ export class Luxtronik1 extends utils.Adapter {
         socket.on('connect', () => {
             connected = true;
             this.log.debug(`${cmd}: Verbunden mit Luxtronik`);
-            // 100 ms warten, damit der RS232-Konverter bereit ist
             this.later(() => {
                 if (!socket.destroyed && socket.writable) {
                     socket.write(`${cmd}\r\n`);
@@ -344,14 +331,14 @@ export class Luxtronik1 extends utils.Adapter {
 
         socket.on('data', (chunk: Buffer) => {
             rxBuffer += chunk.toString('utf8');
+            this.clearTrackedTimer(finishDebounceTimer);
+
             try {
-                // Falls die Luxtronik noch im Editiermodus hängt (Antwort "779" oder "777"),
-                // sofort abbrechen statt 15s auf Timeout zu warten!
+                // Falls die Luxtronik im Editiermodus (779/777) hängt, sofort mit 999 befreien
                 if ((rxBuffer.includes('779') || rxBuffer.includes('777')) && !recoveryTriggered) {
                     recoveryTriggered = true;
-                    this.log.warn(
-                        `${cmd}: Luxtronik meldet offenen Editiermodus (${rxBuffer.replace(/\r?\n/g, ' ').trim()}), sende 999 zum Beenden...`
-                    );
+                    const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+                    this.log.warn(`${cmd}: Offener Editiermodus erkannt ("${preview}"), sende 999...`);
                     if (!socket.destroyed && socket.writable) {
                         socket.write('999\r\n');
                     }
@@ -364,8 +351,19 @@ export class Luxtronik1 extends utils.Adapter {
                 }
 
                 if (isCompleteFn(rxBuffer)) {
-                    this.log.debug(`${cmd}: Daten vollständig empfangen (${rxBuffer.length} Bytes)`);
-                    socket.destroy();
+                    // Falls schon mit \r oder \n abgeschlossen -> sofort schließen,
+                    // sonst 150 ms warten, falls das letzte Zeichen mehrstellig ist (z.B. "-10")
+                    if (rxBuffer.endsWith('\n') || rxBuffer.endsWith('\r')) {
+                        this.log.debug(`${cmd}: Daten vollständig empfangen (${rxBuffer.length} Bytes)`);
+                        socket.destroy();
+                    } else {
+                        finishDebounceTimer = this.later(() => {
+                            if (!socket.destroyed) {
+                                this.log.debug(`${cmd}: Daten vollständig (Debounce, ${rxBuffer.length} Bytes)`);
+                                socket.destroy();
+                            }
+                        }, 150);
+                    }
                 }
             } catch (e) {
                 this.log.warn(`${cmd}: Fehler bei Vollständigkeitsprüfung: ${String(e)}`);
@@ -377,7 +375,7 @@ export class Luxtronik1 extends utils.Adapter {
             const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
             if (connected) {
                 this.log.warn(
-                    `${cmd}: Timeout nach ${idleTimeout} ms (${rxBuffer.length} Zeichen empfangen: "${preview}")`
+                    `${cmd}: Timeout nach ${idleTimeout} ms (${rxBuffer.length} Zeichen empfangen, Rohdaten: "${preview}")`
                 );
             } else {
                 this.log.warn(`${cmd}: Keine Verbindung zum RS232-Konverter möglich (Timeout ${idleTimeout} ms)`);
@@ -392,6 +390,7 @@ export class Luxtronik1 extends utils.Adapter {
 
         socket.on('close', () => {
             this.clearTrackedTimer(hardTimer);
+            this.clearTrackedTimer(finishDebounceTimer);
             if (this.activeSocket === socket) {
                 this.activeSocket = null;
             }
@@ -426,9 +425,10 @@ export class Luxtronik1 extends utils.Adapter {
                 if (success) {
                     this.errorCounters[cmd] = 0;
                 } else {
+                    const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
                     this.errorCounters[cmd] = (this.errorCounters[cmd] ?? 0) + 1;
-                    this.log.debug(
-                        `Datensatz ${cmd} unvollständig/ungültig (Fehler #${this.errorCounters[cmd]})`
+                    this.log.warn(
+                        `Datensatz ${cmd} unvollständig/ungültig (Fehler #${this.errorCounters[cmd]}, Rohdaten: "${preview}")`
                     );
                     if (this.errorCounters[cmd] > 4) {
                         this.resetConnectionState(`Mehrfach unvollständiger Datensatz ${cmd}`);
@@ -479,7 +479,7 @@ export class Luxtronik1 extends utils.Adapter {
         };
 
         socket.on('connect', () => {
-            this.log.debug(`${cmd}: Verbunden mit Luxtronik (Write), sende: ${payloadLine}`);
+            this.log.info(`${cmd}: Sende Schreibbefehl an Luxtronik: ${payloadLine}`);
             this.later(() => safeWrite(`${cmd}\r\n`), 100);
             stepTimer1 = this.later(() => {
                 if (!recoveryTriggered) {
@@ -489,11 +489,11 @@ export class Luxtronik1 extends utils.Adapter {
             stepTimer2 = this.later(() => {
                 if (!recoveryTriggered) {
                     safeWrite('999\r\n');
-                    // Verbindung 1000 ms nach dem Speicherbefehl (999) regulär beenden
                     closeAfterWriteTimer = this.later(() => {
                         if (!socket.destroyed) {
+                            const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
                             this.log.debug(
-                                `${cmd}: Schreibsequenz beendet, schließe Socket (${rxBuffer.length} Bytes empfangen)`
+                                `${cmd}: Schreibsequenz beendet (${rxBuffer.length} Bytes: "${preview}"), schließe Socket`
                             );
                             socket.destroy();
                         }
@@ -539,7 +539,7 @@ export class Luxtronik1 extends utils.Adapter {
 
         socket.on('timeout', () => {
             const preview = rxBuffer.replace(/\r/g, '\\r').replace(/\n/g, '\\n');
-            this.log.warn(`${cmd} (Write): Timeout nach ${idleTimeout} ms (Empfangen: "${preview}")`);
+            this.log.warn(`${cmd} (Write): Timeout nach ${idleTimeout} ms (Rohdaten: "${preview}")`);
             socket.destroy();
         });
 
@@ -581,8 +581,6 @@ export class Luxtronik1 extends utils.Adapter {
 
         socket.connect(this.port, this.deviceIpAddress);
     }
-
-    // --- Spezifische Lese-Funktionen ---
 
     private callLuxtronik1100(done: (success?: boolean) => void): void {
         this.executeRead(
@@ -630,7 +628,7 @@ export class Luxtronik1 extends utils.Adapter {
     private callLuxtronik1800(done: (success?: boolean) => void): void {
         this.executeRead(
             '1800',
-            (buf) => buf.includes('1800;8', 10) && (buf.endsWith('\n') || buf.endsWith('\r')),
+            (buf) => buf.includes('1800;8', 10),
             async (raw) => {
                 if (raw.length <= 500) {
                     return false;
@@ -951,10 +949,7 @@ export class Luxtronik1 extends utils.Adapter {
         );
     }
 
-    // --- Transaktions-Helfer für Read-Modify-Write ---
-
     private updateHeizkurveField(index: number, value: number): void {
-        // Nur vorab 3400 lesen, falls noch kein gültiger Datensatz aus dem Poll vorliegt
         if (!this.lastData3400 || this.lastData3400.length !== 11) {
             this.enqueueCommand('read_3400_for_write', (cb) => {
                 this.callLuxtronik3400(cb);
@@ -969,7 +964,6 @@ export class Luxtronik1 extends utils.Adapter {
             const dataHK = this.lastData3400.map((v) => String(v).trim());
             dataHK[0] = '3401';
             dataHK[index] = String(value);
-            // Lokalen Cache direkt mitführen
             this.lastData3400[index] = String(value);
             this.executeWrite('3401', dataHK.join(';'), null, cb);
         });
@@ -996,8 +990,6 @@ export class Luxtronik1 extends utils.Adapter {
         });
         this.enqueueCommand('verify_2100', (cb) => this.callLuxtronik2100(cb));
     }
-
-    // --- Steuerfunktionen ---
 
     private controlBws(statebws: number): void {
         this.enqueueCommand('write_3501', (cb) => {
@@ -1074,8 +1066,6 @@ export class Luxtronik1 extends utils.Adapter {
             this.executeWrite('2701', arr.join(';'), null, cb);
         });
     }
-
-    // --- Polling & State-Handling ---
 
     private pollLuxtronik(): void {
         if (this.pollQueue.length > 0 || this.isProcessingQueue) {
@@ -1216,8 +1206,6 @@ export class Luxtronik1 extends utils.Adapter {
         ];
         this.controlZeit(payload);
     }
-
-    // --- Formatierungs-Helfer ---
 
     private setFehlerText(fehlerinfo?: string): string {
         try {
