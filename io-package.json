@@ -1,7 +1,7 @@
 {
   "common": {
     "name": "luxtronik1",
-    "version": "0.5.2",
+    "version": "0.5.3",
     "news": {
       "0.5.0": {
         "en": "Migrated adapter to TypeScript\nHardened RS232 socket communication and priority command queue\nReplaced Materialize admin UI with modern jsonConfig",
