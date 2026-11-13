@@ -1,1052 +1,1248 @@
-/**
- * luxtronik1 adapter - hardened & refactored version
- */
+import * as utils from '@iobroker/adapter-core';
+import * as net from 'net';
 
-/* jshint -W097 */
-/* jslint node: true */
-'use strict';
+export interface Luxtronik1Config extends ioBroker.AdapterConfig {
+    host: string;
+    port: number;
+    pollInterval: number;
+    socketTimeout: number;
+}
 
-const utils = require('@iobroker/adapter-core');
-const net = require('net');
+type QueueTaskFn = (done: (success?: boolean) => void) => void | Promise<void>;
 
-let adapter;
-let deviceIpAddress;
-let port;
-let polling = null;
-let unloaded = false;
+interface QueueItem {
+    name: string;
+    taskFn: QueueTaskFn;
+}
 
-// --- Status- & Sperrvariablen ---
-let activeSocket = null;
-let isProcessingQueue = false;
-let schaltzbwblock = false;
-let zeitblock = false;
-let lastData3400 = null;
-let lastData2100 = null;
-let lastsetbws = null;
-let bwretry = 0;
-
-// Fehlerzähler pro Befehl
-const errorCounters = {};
-const timers = new Set();
-
-// Warteschlangen: Steuerbefehle (commandQueue) haben Vorrang vor Abfragen (pollQueue)
-let pollQueue = [];
-let commandQueue = [];
-let currentPollCycleActive = false;
-
-const MODUS = ['AUTO', 'ZWE', 'Party', 'Ferien', 'Aus', 'Aus'];
-const NUMERIC_CONTROLS = [
-  'control.BWs',
-  'control.NachtAbs',
-  'control.ParaVHK',
-  'control.EndpunktHK',
-  'control.AbwRLs',
-  'control.HystBWs',
-  'control.HystHKs'
+const NUMERIC_CONTROLS: readonly string[] = [
+    'control.BWs',
+    'control.NachtAbs',
+    'control.ParaVHK',
+    'control.EndpunktHK',
+    'control.AbwRLs',
+    'control.HystBWs',
+    'control.HystHKs',
 ];
 
-const ERROR_CODES = {
-  '11': 'kein Fehler',
-  '701': 'Niederdruckstörung',
-  '702': 'Niederdrucksperre',
-  '703': 'Frostschutz',
-  '704': 'Heissgasstörung',
-  '705': 'Motorschutz VEN',
-  '706': '',
-  '707': 'Codierung WP',
-  '708': 'Fühler Rücklauf',
-  '709': 'Fühler Vorlauf',
-  '710': 'Fühler Heissgas',
-  '711': 'Fühler Aussentemp.',
-  '712': 'Fühler Brauchwasser',
-  '713': 'Fühler WQ-Ein',
-  '714': 'Heissgas BW',
-  '715': 'Hochdruck-Abschalt.',
-  '716': 'Hochdruckstörung',
-  '717': 'Durchfluss-WQ',
-  '718': 'Max. Aussentemp.',
-  '719': 'Min. Aussentemp.',
-  '720': 'WQ-Temperatur',
-  '721': 'Niederdruckabschaltung',
-  '722': 'Tempdiff Heizwasser',
-  '723': 'Tempdiff Brauchw.',
-  '724': 'Tempdiff Abtauen',
-  '725': 'Anlagefehler BW',
-  '726': 'Fühler Mischkreis 1',
-  '727': 'Soledruck',
-  '728': 'Fühler WQ-Aus',
-  '729': 'Drehfeldfehler',
-  '730': 'Leistung Ausheizen',
-  '731': '',
-  '732': 'Störung Kühlung',
-  '733': 'Störung Anode',
-  '734': 'Störung Anode',
-  '735': 'Fühler Ext. En',
-  '736': 'Fühler Solarkollektor',
-  '737': 'Fühler Solarspeicher',
-  '738': 'Fühler Mischkreis2',
-  '739': 'CAN-Fehler: WP fehlt',
-  '740': 'CAN-Fehler: Timeout',
-  '741': 'CAN-Fehler: Bus off',
-  '742': 'CAN-Fehler: Daten',
-  '743': 'CAN-Fehler: Adresse',
-  '744': '',
-  '745': 'Modem-Fehler'
+const ERROR_CODES: Record<string, string> = {
+    '11': 'kein Fehler',
+    '701': 'Niederdruckstörung',
+    '702': 'Niederdrucksperre',
+    '703': 'Frostschutz',
+    '704': 'Heissgasstörung',
+    '705': 'Motorschutz VEN',
+    '706': '',
+    '707': 'Codierung WP',
+    '708': 'Fühler Rücklauf',
+    '709': 'Fühler Vorlauf',
+    '710': 'Fühler Heissgas',
+    '711': 'Fühler Aussentemp.',
+    '712': 'Fühler Brauchwasser',
+    '713': 'Fühler WQ-Ein',
+    '714': 'Heissgas BW',
+    '715': 'Hochdruck-Abschalt.',
+    '716': 'Hochdruckstörung',
+    '717': 'Durchfluss-WQ',
+    '718': 'Max. Aussentemp.',
+    '719': 'Min. Aussentemp.',
+    '720': 'WQ-Temperatur',
+    '721': 'Niederdruckabschaltung',
+    '722': 'Tempdiff Heizwasser',
+    '723': 'Tempdiff Brauchw.',
+    '724': 'Tempdiff Abtauen',
+    '725': 'Anlagefehler BW',
+    '726': 'Fühler Mischkreis 1',
+    '727': 'Soledruck',
+    '728': 'Fühler WQ-Aus',
+    '729': 'Drehfeldfehler',
+    '730': 'Leistung Ausheizen',
+    '731': '',
+    '732': 'Störung Kühlung',
+    '733': 'Störung Anode',
+    '734': 'Störung Anode',
+    '735': 'Fühler Ext. En',
+    '736': 'Fühler Solarkollektor',
+    '737': 'Fühler Solarspeicher',
+    '738': 'Fühler Mischkreis2',
+    '739': 'CAN-Fehler: WP fehlt',
+    '740': 'CAN-Fehler: Timeout',
+    '741': 'CAN-Fehler: Bus off',
+    '742': 'CAN-Fehler: Daten',
+    '743': 'CAN-Fehler: Adresse',
+    '744': '',
+    '745': 'Modem-Fehler',
 };
 
-// --- Timer- & Shutdown-Management ---
+export class Luxtronik1 extends utils.Adapter {
+    declare public config: Luxtronik1Config;
 
-function later(fn, ms) {
-  const t = setTimeout(() => {
-    timers.delete(t);
-    if (unloaded) return;
-    try {
-      fn();
-    } catch (e) {
-      adapter && adapter.log.warn('Timer-Fehler: ' + e);
-    }
-  }, ms);
-  timers.add(t);
-  return t;
-}
+    private deviceIpAddress = '';
+    private port = 0;
+    private pollingTimer: ioBroker.Interval | null | undefined = null;
+    private unloaded = false;
 
-function clearTimer(t) {
-  if (t) {
-    clearTimeout(t);
-    timers.delete(t);
-  }
-}
+    private activeSocket: net.Socket | null = null;
+    private isProcessingQueue = false;
+    private schaltzbwblock = false;
+    private zeitblock = false;
 
-function shutdown() {
-  unloaded = true;
-  if (polling) {
-    clearInterval(polling);
-    polling = null;
-  }
-  timers.forEach((t) => clearTimeout(t));
-  timers.clear();
-  pollQueue = [];
-  commandQueue = [];
-  isProcessingQueue = false;
-  if (activeSocket) {
-    try {
-      activeSocket.removeAllListeners();
-      activeSocket.on('error', () => {});
-      activeSocket.destroy();
-    } catch (e) { /* ignore */ }
-    activeSocket = null;
-  }
-}
+    private lastData3400: string[] | null = null;
+    private lastData2100: string[] | null = null;
+    private lastsetbws: number | null = null;
+    private bwretry = 0;
 
-function resetConnectionState(reason) {
-  adapter.log.warn('Verbindung zur Luxtronik wird zurückgesetzt (' + reason + ')');
-  pollQueue = [];
-  currentPollCycleActive = false;
-  Object.keys(errorCounters).forEach((k) => { errorCounters[k] = 0; });
-  adapter.setState('info.connection', false, true);
-}
+    private readonly errorCounters: Record<string, number> = {};
+    private readonly timers = new Set<ioBroker.Timeout>();
 
-// --- Zentrale Queue-Steuerung ---
+    private pollQueue: QueueItem[] = [];
+    private commandQueue: QueueItem[] = [];
+    private currentPollCycleActive = false;
 
-function enqueueCommand(name, taskFn) {
-  commandQueue.push({ name, taskFn });
-  processQueues();
-}
+    public constructor(options: Partial<utils.AdapterOptions> = {}) {
+        super({
+            ...options,
+            name: 'luxtronik1',
+        });
 
-function enqueuePoll(name, taskFn) {
-  pollQueue.push({ name, taskFn });
-  processQueues();
-}
-
-function processQueues() {
-  if (unloaded || isProcessingQueue || activeSocket) return;
-
-  // Steuerbefehle haben immer Vorrang vor normalen Poll-Abfragen
-  const nextItem = commandQueue.shift() || pollQueue.shift();
-  if (!nextItem) {
-    currentPollCycleActive = false;
-    return;
-  }
-
-  isProcessingQueue = true;
-  try {
-    nextItem.taskFn(() => {
-      isProcessingQueue = false;
-      // Kurze Pause (300 ms) zur Entlastung des RS232-Konverters vor dem nächsten Request
-      later(processQueues, 300);
-    });
-  } catch (e) {
-    adapter.log.warn('Fehler bei Ausführung von ' + nextItem.name + ': ' + e);
-    isProcessingQueue = false;
-    later(processQueues, 500);
-  }
-}
-
-// --- Generische Socket-Kommunikation (Lesen & Schreiben) ---
-
-/**
- * Führt eine Lese-Abfrage durch (z. B. 1100, 1800, 2100, 3200, 3400, 3405, 3505)
- */
-function executeRead(cmd, isCompleteFn, parseFn, doneCallback) {
-  if (unloaded) return doneCallback();
-
-  let rxBuffer = '';
-  let timedOut = false;
-  let hadError = false;
-  let connected = false;
-
-  const idleTimeout = parseInt(adapter.config.socketTimeout, 10) || 15000;
-  const socket = new net.Socket();
-  activeSocket = socket;
-
-  socket.setTimeout(idleTimeout);
-
-  const hardTimer = later(() => {
-    if (!socket.destroyed) {
-      adapter.log.warn(cmd + ': Anfrage dauert zu lange (Hard-Timeout), Verbindung wird geschlossen');
-      timedOut = true;
-      socket.destroy();
-    }
-  }, idleTimeout * 3);
-
-  socket.on('connect', () => {
-    connected = true;
-    adapter.log.debug(cmd + ': Verbunden mit Luxtronik');
-    socket.write(cmd + '\r\n');
-  });
-
-  socket.on('data', (chunk) => {
-    rxBuffer += chunk.toString('utf8');
-    try {
-      if (isCompleteFn(rxBuffer)) {
-        adapter.log.debug(cmd + ': Daten vollständig empfangen');
-        socket.destroy();
-      }
-    } catch (e) {
-      adapter.log.warn(cmd + ': Fehler bei Vollständigkeitsprüfung: ' + e);
-    }
-  });
-
-  socket.on('timeout', () => {
-    timedOut = true;
-    if (connected) {
-      adapter.log.warn(cmd + ': Timeout nach ' + idleTimeout + ' ms (' + rxBuffer.length + ' Zeichen empfangen)');
-    } else {
-      adapter.log.warn(cmd + ': Keine Verbindung zum RS232-Konverter möglich (Timeout ' + idleTimeout + ' ms)');
-    }
-    socket.destroy();
-  });
-
-  socket.on('error', (err) => {
-    hadError = true;
-    adapter.log.warn(cmd + ' Socket-Fehler: ' + err.message);
-  });
-
-  socket.on('close', () => {
-    clearTimer(hardTimer);
-    if (activeSocket === socket) activeSocket = null;
-
-    if (hadError || timedOut) {
-      adapter.setState('info.connection', false, true);
-      if (timedOut && pollQueue.length > 0) {
-        adapter.log.debug('Abfragezyklus wegen Timeout abgebrochen (' + pollQueue.length + ' Abfragen übersprungen)');
-        pollQueue = [];
-        currentPollCycleActive = false;
-      }
-      return doneCallback(false);
+        this.on('ready', this.onReady.bind(this));
+        this.on('stateChange', this.onStateChange.bind(this));
+        this.on('unload', this.onUnload.bind(this));
     }
 
-    let success = false;
-    try {
-      success = parseFn(rxBuffer.trim());
-    } catch (e) {
-      adapter.log.warn('callluxtronik' + cmd + ' - Parse-Fehler: ' + e);
-      success = false;
-    }
+    // --- Lifecycle-Methoden ---
 
-    if (success) {
-      errorCounters[cmd] = 0;
-    } else {
-      errorCounters[cmd] = (errorCounters[cmd] || 0) + 1;
-      adapter.log.debug('Datensatz ' + cmd + ' unvollständig/ungültig (Fehler #' + errorCounters[cmd] + ')');
-      if (errorCounters[cmd] > 4) {
-        resetConnectionState('Mehrfach unvollständiger Datensatz ' + cmd);
-      }
-    }
-
-    doneCallback(success);
-  });
-
-  socket.connect(port, deviceIpAddress);
-}
-
-/**
- * Führt ein Schreib-Kommando durch (z. B. 3401, 2101, 3406, 3506, 3501, 3201, 2701)
- * Unterstützt automatische 779-Fehlerbehebung (Abbruch & Reset des Editiermodus)
- */
-function executeWrite(cmd, payloadLine, onCloseParseFn, doneCallback) {
-  if (unloaded) return doneCallback();
-
-  let rxBuffer = '';
-  let recoveryTriggered = false;
-  let stepTimer1 = null;
-  let stepTimer2 = null;
-
-  const idleTimeout = parseInt(adapter.config.socketTimeout, 10) || 15000;
-  const socket = new net.Socket();
-  activeSocket = socket;
-
-  socket.setTimeout(idleTimeout);
-
-  const hardTimer = later(() => {
-    if (!socket.destroyed) {
-      adapter.log.warn(cmd + ' (Write): Hard-Timeout erreicht, Verbindung wird geschlossen');
-      socket.destroy();
-    }
-  }, idleTimeout * 3);
-
-  function safeWrite(str) {
-    if (!socket.destroyed && socket.writable) {
-      socket.write(str);
-    }
-  }
-
-  socket.on('connect', () => {
-    adapter.log.debug(cmd + ': Verbunden mit Luxtronik (Write)');
-    safeWrite(cmd + '\r\n');
-    stepTimer1 = later(() => {
-      if (!recoveryTriggered) safeWrite(payloadLine + '\r\n');
-    }, 1500);
-    stepTimer2 = later(() => {
-      if (!recoveryTriggered) safeWrite('999\r\n');
-    }, 3000);
-  });
-
-  socket.on('data', (chunk) => {
-    rxBuffer += chunk.toString('utf8');
-    try {
-      // Fehler 779 = Luxtronik ist noch in einem alten Programmiermodus blockiert
-      if (rxBuffer.includes('779') && !recoveryTriggered) {
-        recoveryTriggered = true;
-        clearTimer(stepTimer1);
-        clearTimer(stepTimer2);
-        adapter.log.warn(cmd + ': Kommunikationsstörung (779) erkannt, führe Reset-Sequenz aus...');
-
-        later(() => safeWrite(cmd + '\r\n'), 300);
-        later(() => safeWrite(cmd + ';0\r\n'), 1000);
-        later(() => safeWrite('999\r\n'), 1800);
-        later(() => {
-          if (!socket.destroyed) socket.destroy();
-        }, 2500);
-        return;
-      }
-
-      if (rxBuffer.includes('993\r\n999') || rxBuffer.includes('993\n999')) {
-        socket.destroy();
-      }
-    } catch (e) {
-      adapter.log.debug(cmd + ': Fehler bei Störungsbehebung: ' + e);
-    }
-  });
-
-  socket.on('timeout', () => {
-    adapter.log.warn(cmd + ' (Write): Timeout nach ' + idleTimeout + ' ms');
-    socket.destroy();
-  });
-
-  socket.on('error', (err) => {
-    adapter.log.warn(cmd + ' (Write) Socket-Fehler: ' + err.message);
-  });
-
-  socket.on('close', () => {
-    clearTimer(hardTimer);
-    clearTimer(stepTimer1);
-    clearTimer(stepTimer2);
-    if (activeSocket === socket) activeSocket = null;
-
-    try {
-      if (rxBuffer !== '' && !recoveryTriggered && onCloseParseFn) {
-        onCloseParseFn(rxBuffer.trim());
-      } else if (recoveryTriggered) {
-        adapter.log.warn(cmd + ': Editiermodus wurde nach Fehler 779 zurückgesetzt. Befehl wird erneut eingereiht.');
-        // Nach 779-Recovery den eigentlichen Schreibbefehl einmal automatisch wiederholen
-        later(() => {
-          enqueueCommand(cmd + '_retry', (cb) => executeWrite(cmd, payloadLine, onCloseParseFn, cb));
-        }, 1000);
-      }
-    } catch (e) {
-      adapter.log.warn('callluxtronik' + cmd + ' - Fehler: ' + e);
-    }
-
-    adapter.log.debug('Daten ' + cmd + ' fertig verarbeitet.');
-    doneCallback(!recoveryTriggered);
-  });
-
-  socket.connect(port, deviceIpAddress);
-}
-
-// --- Hilfsfunktionen für Protokoll-Prüfungen ---
-
-function isSingleLineComplete(expectedCmd, buffer) {
-  if (!buffer.includes(expectedCmd)) return false;
-  if (!buffer.endsWith('\n') && !buffer.endsWith('\r')) return false;
-  const clean = buffer.replace(/(\r\n|\n|\r)/gm, '');
-  const parts = clean.split(';');
-  const expectedCount = parseInt(parts[1], 10);
-  return !Number.isNaN(expectedCount) && parts.length === expectedCount + 2;
-}
-
-// --- Spezifische Lese-Funktionen ---
-
-function callluxtronik1100(done) {
-  executeRead(
-    '1100',
-    (buf) => isSingleLineComplete('1100', buf),
-    (raw) => {
-      if (raw.length <= 40) return false;
-      const arr = raw.replace(/(\r\n|\n|\r)/gm, '').split(';');
-      if (arr.length !== parseInt(arr[1], 10) + 2) return false;
-
-      if (lastsetbws !== null && Number(arr[8]) !== Number(lastsetbws)) {
-        adapter.log.info('BW-Solltemperatur nicht korrekt gesetzt (' + arr[8] + ' statt ' + lastsetbws + '), Vorgang wird wiederholt');
-        if ((errorCounters['1100_bws'] || 0) < 5) {
-          errorCounters['1100_bws'] = (errorCounters['1100_bws'] || 0) + 1;
-          controlbws(lastsetbws);
-        } else {
-          errorCounters['1100_bws'] = 0;
-          resetConnectionState('Setzen der BW-Solltemperatur mehrmals fehlgeschlagen');
+    private async onReady(): Promise<void> {
+        if (!this.config.host) {
+            this.log.warn('[START] Keine IP-Adresse konfiguriert');
+            return;
         }
-        return true;
-      }
 
-      errorCounters['1100_bws'] = 0;
-      adapter.setState('temperaturen.VL', arr[2] / 10, true);
-      adapter.setState('temperaturen.RL', arr[3] / 10, true);
-      adapter.setState('temperaturen.RLs', arr[4] / 10, true);
-      adapter.setState('temperaturen.HG', arr[5] / 10, true);
-      adapter.setState('temperaturen.AUT', arr[6] / 10, true);
-      adapter.setState('temperaturen.BWi', arr[7] / 10, true);
-      adapter.setState('temperaturen.BWs', arr[8] / 10, true);
-      adapter.setState('temperaturen.WQe', arr[9] / 10, true);
-      adapter.setState('temperaturen.WQa', arr[10] / 10, true);
-      adapter.setState('temperaturen.MK1VLi', arr[11] / 10, true);
-      adapter.setState('temperaturen.MK1VLs', arr[12] / 10, true);
-      adapter.setState('temperaturen.RS', arr[13] / 10, true);
-      return true;
-    },
-    done
-  );
-}
+        this.unloaded = false;
+        await this.setStateAsync('info.connection', false, true);
 
-function callluxtronik1800(done) {
-  executeRead(
-    '1800',
-    (buf) => buf.includes('1800;8', 10) && (buf.endsWith('\n') || buf.endsWith('\r')),
-    (raw) => {
-      if (raw.length <= 500) return false;
-      const lines = raw.split(/\r?\n/);
-      if (lines.length <= 21) return false;
+        this.deviceIpAddress = String(this.config.host).trim();
+        this.port = Number(this.config.port);
 
-      const temperaturen = lines[2].split(';'); // 1100
-      adapter.setState('temperaturen.VL', temperaturen[2] / 10, true);
-      adapter.setState('temperaturen.RL', temperaturen[3] / 10, true);
-      adapter.setState('temperaturen.RLs', temperaturen[4] / 10, true);
-      adapter.setState('temperaturen.HG', temperaturen[5] / 10, true);
-      adapter.setState('temperaturen.AUT', temperaturen[6] / 10, true);
-      adapter.setState('temperaturen.BWi', temperaturen[7] / 10, true);
-      adapter.setState('temperaturen.BWs', temperaturen[8] / 10, true);
-      if (currentPollCycleActive) {
-        adapter.setState('control.BWs', temperaturen[8] / 10, true);
-      }
-      adapter.setState('temperaturen.WQe', temperaturen[9] / 10, true);
-      adapter.setState('temperaturen.WQa', temperaturen[10] / 10, true);
-      adapter.setState('temperaturen.MK1VLi', temperaturen[11] / 10, true);
-      adapter.setState('temperaturen.MK1VLs', temperaturen[12] / 10, true);
-      adapter.setState('temperaturen.RS', temperaturen[13] / 10, true);
-
-      const eingaenge = lines[3].split(';'); // 1200
-      adapter.setState('eingaenge.ASD', !!+eingaenge[2], true);
-      adapter.setState('eingaenge.EVU', !!+eingaenge[3], true);
-      adapter.setState('eingaenge.HD', !!+eingaenge[4], true);
-      adapter.setState('eingaenge.MOT', !!+eingaenge[5], true);
-      adapter.setState('eingaenge.ND', !!+eingaenge[6], true);
-      adapter.setState('eingaenge.PEX', !!+eingaenge[7], true);
-
-      const ausgaenge = lines[4].split(';'); // 1300
-      adapter.setState('ausgaenge.Abtauventil', !!+ausgaenge[2], true);
-      adapter.setState('ausgaenge.Brauchwarmwasserumwaelzpumpe', !!+ausgaenge[3], true);
-      adapter.setState('ausgaenge.Fussbodenheizungsumwaelzpumpe', !!+ausgaenge[4], true);
-      adapter.setState('ausgaenge.Heizungsumwaelzpumpe', !!+ausgaenge[5], true);
-      adapter.setState('ausgaenge.Mischer_1_Auf', !!+ausgaenge[6], true);
-      adapter.setState('ausgaenge.Mischer_1_Zu', !!+ausgaenge[7], true);
-      adapter.setState('ausgaenge.Ventilation_des_Waermepumpengehaeuses', !!+ausgaenge[8], true);
-      adapter.setState('ausgaenge.Ventilator_Brunnen_oder_Soleumwaelzpumpe', !!+ausgaenge[9], true);
-      adapter.setState('ausgaenge.Verdichter_1_in_Waermepumpe', !!+ausgaenge[10], true);
-      adapter.setState('ausgaenge.Verdichter_2_in_Waermepumpe', !!+ausgaenge[11], true);
-      adapter.setState('ausgaenge.Zusatzumwaelzpumpe_Zirkulationspumpe', !!+ausgaenge[12], true);
-      adapter.setState('ausgaenge.Zweiter_Waermeerzeuger_1', !!+ausgaenge[13], true);
-      adapter.setState('ausgaenge.Zweiter_Waermeerzeuger_2_Sammelstoerung', !!+ausgaenge[14], true);
-
-      const ablaufzeiten = lines[5].split(';'); // 1400
-      const currentWpSeit = parseInt(ablaufzeiten[2], 10) * 3600 + parseInt(ablaufzeiten[3], 10) * 60 + parseInt(ablaufzeiten[4], 10);
-
-      adapter.getState('ablaufzeiten.WPseit', (err, state) => {
-        if (state && currentWpSeit === 0 && state.val > 0) {
-          adapter.setState('ablaufzeiten.WPseitlast', state.val, true);
+        if (!(this.port > 0 && this.port < 65536)) {
+            this.log.error(`[START] Ungültiger Port: ${this.config.port}`);
+            return;
         }
-        adapter.setState('ablaufzeiten.WPseit', currentWpSeit, true);
-      });
 
-      adapter.setState('ablaufzeiten.ZWE1seit', parseInt(ablaufzeiten[5], 10) * 3600 + parseInt(ablaufzeiten[6], 10) * 60 + parseInt(ablaufzeiten[7], 10), true);
-      adapter.setState('ablaufzeiten.ZWE2seit', parseInt(ablaufzeiten[8], 10) * 3600 + parseInt(ablaufzeiten[9], 10) * 60 + parseInt(ablaufzeiten[10], 10), true);
-      adapter.setState('ablaufzeiten.Netzeinv', parseInt(ablaufzeiten[11], 10), true);
-      adapter.setState('ablaufzeiten.SSPstand', parseInt(ablaufzeiten[12], 10) * 60 + parseInt(ablaufzeiten[13], 10), true);
-      adapter.setState('ablaufzeiten.SSPverz', parseInt(ablaufzeiten[14], 10) * 60 + parseInt(ablaufzeiten[15], 10), true);
-      adapter.setState('ablaufzeiten.VDstand', parseInt(ablaufzeiten[16], 10) * 3600 + parseInt(ablaufzeiten[17], 10) * 60 + parseInt(ablaufzeiten[18], 10), true);
-      adapter.setState('ablaufzeiten.HRM', parseInt(ablaufzeiten[19], 10) * 3600 + parseInt(ablaufzeiten[20], 10) * 60 + parseInt(ablaufzeiten[21], 10), true);
-      adapter.setState('ablaufzeiten.HRW', parseInt(ablaufzeiten[22], 10) * 3600 + parseInt(ablaufzeiten[23], 10) * 60 + parseInt(ablaufzeiten[24], 10), true);
-      adapter.setState('ablaufzeiten.TDIseit', parseInt(ablaufzeiten[25], 10) * 3600 + parseInt(ablaufzeiten[26], 10) * 60 + parseInt(ablaufzeiten[27], 10), true);
-      adapter.setState('ablaufzeiten.BWsperre', parseInt(ablaufzeiten[28], 10) * 3600 + parseInt(ablaufzeiten[29], 10) * 60 + parseInt(ablaufzeiten[30], 10), true);
+        const pollingTime = Math.max(Number(this.config.pollInterval) || 300000, 10000);
+        this.log.info(
+            `[START] Luxtronik-Adapter gestartet (${this.deviceIpAddress}:${this.port}, Intervall: ${pollingTime} ms)`
+        );
 
-      const betriebsstunden = lines[6].split(';');
-      adapter.setState('betriebsstunden.VD1', toTimeString(betriebsstunden[2]), true);
-      adapter.setState('betriebsstunden.Imp1', betriebsstunden[3], true);
-      adapter.setState('betriebsstunden.AvVD1', toTimeString(betriebsstunden[4]), true);
-      adapter.setState('betriebsstunden.VD2', toTimeString(betriebsstunden[5]), true);
-      adapter.setState('betriebsstunden.Imp2', betriebsstunden[6], true);
-      adapter.setState('betriebsstunden.AvVD2', toTimeString(betriebsstunden[7]), true);
-      adapter.setState('betriebsstunden.ZWE1', toTimeString(betriebsstunden[8]), true);
-      adapter.setState('betriebsstunden.ZWE2', toTimeString(betriebsstunden[9]), true);
-      adapter.setState('betriebsstunden.WP', toTimeString(betriebsstunden[10]), true);
+        this.subscribeStates('control.*');
+        this.pollLuxtronik();
 
-      for (let i = 1; i < 6; i++) {
-        adapter.setState('fehler.' + (6 - i), setfehlertext(lines[7 + i]), true);
-        adapter.setState('abschaltungen.' + (6 - i), setabschalttext(lines[14 + i]), true);
-      }
-
-      const statusParts = lines[21].split(';');
-      adapter.setState('status.WPtyp', String(statusParts[2]), true);
-      adapter.setState('status.SW', String(statusParts[3]), true);
-      adapter.setState('status.BivStufe', String(statusParts[4]), true);
-      adapter.setState('status.ANL', setstatustext(String(lines[21])), true);
-
-      adapter.setState('info.connection', true, true);
-      return true;
-    },
-    done
-  );
-}
-
-function callluxtronik2100(done) {
-  executeRead(
-    '2100',
-    (buf) => isSingleLineComplete('2100', buf),
-    (raw) => {
-      const arr = raw.replace(/(\r\n|\n|\r)/gm, '').split(';');
-      if (arr.length !== parseInt(arr[1], 10) + 2) return false;
-
-      lastData2100 = arr.slice();
-      adapter.setState('temperaturen.einstellungen.RLBegr', arr[2] / 10, true);
-      adapter.setState('temperaturen.einstellungen.HystHR', arr[3] / 10, true);
-      if (currentPollCycleActive) {
-        adapter.setState('control.HystHKs', arr[3] / 10, true);
-      }
-      adapter.setState('temperaturen.einstellungen.TRErhMax', arr[4] / 10, true);
-      adapter.setState('temperaturen.einstellungen.Freig2VD', arr[5] / 10, true);
-      adapter.setState('temperaturen.einstellungen.FreigZWE', arr[6] / 10, true);
-      adapter.setState('temperaturen.einstellungen.T-Luftabt', arr[7] / 10, true);
-      adapter.setState('temperaturen.einstellungen.TDIsoll', arr[8] / 10, true);
-      adapter.setState('temperaturen.einstellungen.HystBW', arr[9] / 10, true);
-      if (currentPollCycleActive) {
-        adapter.setState('control.HystBWs', arr[9] / 10, true);
-      }
-      adapter.setState('temperaturen.einstellungen.VL2VDBW', arr[10] / 10, true);
-      adapter.setState('temperaturen.einstellungen.TAussenMax', arr[11] / 10, true);
-      adapter.setState('temperaturen.einstellungen.TAussenMin', arr[12] / 10, true);
-      adapter.setState('temperaturen.einstellungen.TWQMin', arr[13] / 10, true);
-      adapter.setState('temperaturen.einstellungen.THGMax', arr[14] / 10, true);
-      adapter.setState('temperaturen.einstellungen.TLAbtEnde', arr[15] / 10, true);
-      adapter.setState('temperaturen.einstellungen.AbsenkBis', arr[16] / 10, true);
-      adapter.setState('temperaturen.einstellungen.VLmax', arr[17] / 10, true);
-      return true;
-    },
-    done
-  );
-}
-
-function callluxtronik3405(done) {
-  executeRead(
-    '3405',
-    (buf) => isSingleLineComplete('3405', buf),
-    (raw) => {
-      const arr = raw.replace(/(\r\n|\n|\r)/gm, '').split(';');
-      if (arr.length !== parseInt(arr[1], 10) + 2) return false;
-      const val = parseInt(arr[2], 10);
-      adapter.setState('status.ModusHeizung', val, true);
-      if (currentPollCycleActive) {
-        adapter.setState('control.ModusHeizung', val, true);
-      }
-      return true;
-    },
-    done
-  );
-}
-
-function callluxtronik3505(done) {
-  executeRead(
-    '3505',
-    (buf) => isSingleLineComplete('3505', buf),
-    (raw) => {
-      const arr = raw.replace(/(\r\n|\n|\r)/gm, '').split(';');
-      if (arr.length !== parseInt(arr[1], 10) + 2) return false;
-      const val = parseInt(arr[2], 10);
-      adapter.setState('status.ModusWW', val, true);
-      if (currentPollCycleActive) {
-        adapter.setState('control.ModusWW', val, true);
-      }
-      return true;
-    },
-    done
-  );
-}
-
-function callluxtronik3400(done) {
-  executeRead(
-    '3400',
-    (buf) => isSingleLineComplete('3400', buf),
-    (raw) => {
-      const arr = raw.replace(/(\r\n|\n|\r)/gm, '').split(';');
-      if (arr.length !== 11) return false;
-
-      lastData3400 = arr.slice();
-      adapter.setState('heizkurve.AbwRLs', arr[2] / 10, true);
-      adapter.setState('heizkurve.Endpunkt', arr[3] / 10, true);
-      adapter.setState('heizkurve.ParaV', arr[4] / 10, true);
-      adapter.setState('heizkurve.NachtAbs', arr[5] / 10, true);
-      if (currentPollCycleActive) {
-        adapter.setState('control.AbwRLs', arr[2] / 10, true);
-        adapter.setState('control.EndpunktHK', arr[3] / 10, true);
-        adapter.setState('control.ParaVHK', arr[4] / 10, true);
-        adapter.setState('control.NachtAbs', arr[5] / 10, true);
-      }
-      return true;
-    },
-    done
-  );
-}
-
-function callluxtronik3200(done) {
-  executeRead(
-    '3200',
-    (buf) => isSingleLineComplete('3200', buf),
-    (raw) => {
-      const arr = raw.replace(/(\r\n|\n|\r)/gm, '').split(';');
-      if (arr.length !== parseInt(arr[1], 10) + 2) return false;
-
-      const s1 = arr[2].padStart(2, '0') + ':' + arr[3].padStart(2, '0');
-      const e1 = arr[4].padStart(2, '0') + ':' + arr[5].padStart(2, '0');
-      const s2 = arr[6].padStart(2, '0') + ':' + arr[7].padStart(2, '0');
-      const e2 = arr[8].padStart(2, '0') + ':' + arr[9].padStart(2, '0');
-
-      if (!schaltzbwblock) {
-        adapter.setState('control.SchaltzWoBW.Start1', s1, true);
-        adapter.setState('control.SchaltzWoBW.Ende1', e1, true);
-        adapter.setState('control.SchaltzWoBW.Start2', s2, true);
-        adapter.setState('control.SchaltzWoBW.Ende2', e2, true);
-      }
-      adapter.setState('status.SchaltzWoBW.Start1', s1, true);
-      adapter.setState('status.SchaltzWoBW.Ende1', e1, true);
-      adapter.setState('status.SchaltzWoBW.Start2', s2, true);
-      adapter.setState('status.SchaltzWoBW.Ende2', e2, true);
-      return true;
-    },
-    done
-  );
-}
-
-// --- Transaktions-Helfer für Read-Modify-Write (Heizkurve & Hysterese) ---
-
-function updateHeizkurveField(index, value) {
-  enqueueCommand('read_3400_for_write', (cb) => {
-    lastData3400 = null;
-    callluxtronik3400(cb);
-  });
-  enqueueCommand('write_3401', (cb) => {
-    if (!lastData3400 || lastData3400.length < 11) {
-      adapter.log.warn('Heizkurve nicht geändert: aktuelle Werte (3400) konnten nicht gelesen werden');
-      return cb();
-    }
-    const dataHK = lastData3400.map((v) => String(v).trim());
-    dataHK[0] = '3401';
-    dataHK[index] = String(value);
-    executeWrite('3401', dataHK.join(';'), null, cb);
-  });
-  enqueueCommand('verify_3400', callluxtronik3400);
-}
-
-function updateHystereseField(index, value) {
-  enqueueCommand('read_2100_for_write', (cb) => {
-    lastData2100 = null;
-    callluxtronik2100(cb);
-  });
-  enqueueCommand('write_2101', (cb) => {
-    if (!lastData2100 || lastData2100.length < 10) {
-      adapter.log.warn('Hysterese nicht geändert: aktuelle Werte (2100) konnten nicht gelesen werden');
-      return cb();
-    }
-    const dataHyst = lastData2100.map((v) => String(v).trim());
-    dataHyst[0] = '2101';
-    dataHyst[index] = String(value);
-    executeWrite('2101', dataHyst.join(';'), null, cb);
-  });
-  enqueueCommand('verify_2100', callluxtronik2100);
-}
-
-// --- Steuerfunktionen ---
-
-function controlbws(statebws) {
-  enqueueCommand('write_3501', (cb) => {
-    executeWrite(
-      '3501',
-      '3501;1;' + statebws,
-      (raw) => {
-        const lines = raw.split(/\r?\n/);
-        const confirmedVal = lines[3] ? lines[3].split(';')[2] : null;
-        if (confirmedVal !== undefined && Number(confirmedVal) === Number(lastsetbws)) {
-          bwretry = 0;
-          adapter.setState('temperaturen.BWs', Number(confirmedVal) / 10, true);
-          enqueueCommand('verify_1100', callluxtronik1100);
-        } else {
-          bwretry++;
-          if (bwretry <= 3) {
-            adapter.log.debug('BW-Solltemperatur setzen nicht erfolgreich, Wiederholung (' + bwretry + '/3)');
-            controlbws(lastsetbws);
-          } else {
-            adapter.log.warn('Warmwasser-Soll konnte nicht gesetzt werden, Vorgang abgebrochen');
-          }
-        }
-      },
-      cb
-    );
-  });
-}
-
-function controlmodusww(statemodusww) {
-  enqueueCommand('write_3506', (cb) => {
-    executeWrite(
-      '3506',
-      '3506;1;' + statemodusww,
-      () => adapter.setState('status.ModusWW', statemodusww, true),
-      cb
-    );
-  });
-}
-
-function controlmodusheizung(statemodusheizung) {
-  enqueueCommand('write_3406', (cb) => {
-    executeWrite(
-      '3406',
-      '3406;1;' + statemodusheizung,
-      () => adapter.setState('status.ModusHeizung', statemodusheizung, true),
-      cb
-    );
-  });
-}
-
-function controlSchaltzWoBW(arr) {
-  schaltzbwblock = false;
-  enqueueCommand('write_3201', (cb) => {
-    executeWrite('3201', arr.join(';'), () => {
-      enqueueCommand('verify_3200', callluxtronik3200);
-    }, cb);
-  });
-}
-
-function controlZeit(arr) {
-  zeitblock = false;
-  enqueueCommand('write_2701', (cb) => {
-    executeWrite('2701', arr.join(';'), null, cb);
-  });
-}
-
-// --- Polling & State-Handling ---
-
-function pollluxtronik() {
-  if (pollQueue.length > 0 || isProcessingQueue) {
-    adapter.log.debug('Vorheriger Poll oder Befehl noch aktiv, überspringe diesen Zyklus');
-    return;
-  }
-  currentPollCycleActive = true;
-  enqueuePoll('1800', callluxtronik1800);
-  enqueuePoll('2100', callluxtronik2100);
-  enqueuePoll('3405', callluxtronik3405);
-  enqueuePoll('3505', callluxtronik3505);
-  enqueuePoll('3400', callluxtronik3400);
-  enqueuePoll('3200', callluxtronik3200);
-}
-
-function toTenths(value, id) {
-  const n = Number(value);
-  if (value === null || value === '' || typeof value === 'boolean' || !Number.isFinite(n)) {
-    adapter.log.warn('Ungültiger Wert für ' + id + ': ' + value + ' - Befehl wird ignoriert');
-    return null;
-  }
-  return Math.round(n * 10);
-}
-
-function controlluxtronik(id, stateVal) {
-  try {
-    let tenths = null;
-    if (NUMERIC_CONTROLS.includes(id)) {
-      tenths = toTenths(stateVal, id);
-      if (tenths === null) return;
+        this.pollingTimer = this.setInterval(() => {
+            if (!this.unloaded) {
+                this.pollLuxtronik();
+            }
+        }, pollingTime);
     }
 
-    switch (id) {
-      case 'control.BWs':
-        bwretry = 0;
-        lastsetbws = tenths;
-        controlbws(tenths);
-        break;
-      case 'control.ModusWW':
-        controlmodusww(stateVal);
-        break;
-      case 'control.ModusHeizung':
-        controlmodusheizung(stateVal);
-        break;
-      case 'control.AbwRLs':
-        updateHeizkurveField(2, tenths);
-        break;
-      case 'control.EndpunktHK':
-        updateHeizkurveField(3, tenths);
-        break;
-      case 'control.ParaVHK':
-        updateHeizkurveField(4, tenths);
-        break;
-      case 'control.NachtAbs':
-        updateHeizkurveField(5, tenths);
-        break;
-      case 'control.HystHKs':
-        updateHystereseField(3, tenths);
-        break;
-      case 'control.HystBWs':
-        updateHystereseField(9, tenths);
-        break;
-      case 'control.SchaltzWoBW.senden':
-        readStatesAndSendSchaltzeiten();
-        break;
-      case 'control.Zeit.senden':
-        readStatesAndSendZeit();
-        break;
-      default:
-        if (id.includes('control.SchaltzWoBW.Start') || id.includes('control.SchaltzWoBW.Ende')) {
-          schaltzbwblock = true;
-          later(() => { schaltzbwblock = false; }, 60000);
-        } else if (id.includes('control.Zeit.uhrzeit') || id.includes('control.Zeit.dow') || id.includes('control.Zeit.datum')) {
-          zeitblock = true;
-          later(() => { zeitblock = false; }, 60000);
+    private onUnload(callback: () => void): void {
+        try {
+            this.shutdown();
+            this.log.info('[END] Stopping luxtronik adapter...');
+            void this.setState('info.connection', false, true);
+            callback();
+        } catch {
+            callback();
         }
     }
-  } catch (e) {
-    adapter.log.warn('controlluxtronik-Fehler: ' + e);
-  }
-}
 
-function readStatesAndSendSchaltzeiten() {
-  const keys = [
-    'control.SchaltzWoBW.Start1',
-    'control.SchaltzWoBW.Ende1',
-    'control.SchaltzWoBW.Start2',
-    'control.SchaltzWoBW.Ende2'
-  ];
-  const results = [];
-
-  function next(idx) {
-    if (idx >= keys.length) {
-      const payload = ['3201', '8'];
-      for (const timeStr of results) {
-        const str = String(timeStr || '00:00');
-        payload.push(Number(str.slice(0, 2)), Number(str.slice(-2)));
-      }
-      controlSchaltzWoBW(payload);
-      return;
-    }
-    adapter.getState(keys[idx], (err, state) => {
-      if (err || !state || typeof state.val !== 'string') {
-        adapter.log.warn('Fehler beim Auslesen von ' + keys[idx]);
-        return;
-      }
-      results.push(state.val);
-      next(idx + 1);
-    });
-  }
-  next(0);
-}
-
-function readStatesAndSendZeit() {
-  adapter.getState('control.Zeit.datum', (err1, sDatum) => {
-    adapter.getState('control.Zeit.dow', (err2, sDow) => {
-      adapter.getState('control.Zeit.uhrzeit', (err3, sZeit) => {
-        if (!sDatum || !sDow || !sZeit || !sDatum.val || !sZeit.val) {
-          adapter.log.warn('Fehler beim Auslesen der Zeitfelder');
-          return;
+    private onStateChange(id: string, state: ioBroker.State | null | undefined): void {
+        if (!id || !state || state.ack) {
+            return;
         }
+        const shortId = id.substring(this.namespace.length + 1);
+        this.log.debug(`Steuerbefehl empfangen: ${shortId} = ${state.val}`);
+        void this.controlLuxtronik(shortId, state.val);
+    }
+
+    // --- Timer- & Shutdown-Management ---
+
+    private later(fn: () => void, ms: number): ioBroker.Timeout | undefined {
+        const t = this.setTimeout(() => {
+            if (t) {
+                this.timers.delete(t);
+            }
+            if (this.unloaded) {
+                return;
+            }
+            try {
+                fn();
+            } catch (e) {
+                this.log.warn(`Timer-Fehler: ${String(e)}`);
+            }
+        }, ms);
+
+        if (t) {
+            this.timers.add(t);
+        }
+        return t;
+    }
+
+    private clearTrackedTimer(t: ioBroker.Timeout | null | undefined): void {
+        if (t) {
+            this.clearTimeout(t);
+            this.timers.delete(t);
+        }
+    }
+
+    private shutdown(): void {
+        this.unloaded = true;
+        if (this.pollingTimer) {
+            this.clearInterval(this.pollingTimer);
+            this.pollingTimer = undefined;
+        }
+        this.timers.forEach((t) => this.clearTimeout(t));
+        this.timers.clear();
+        this.pollQueue = [];
+        this.commandQueue = [];
+        this.isProcessingQueue = false;
+
+        if (this.activeSocket) {
+            try {
+                this.activeSocket.removeAllListeners();
+                this.activeSocket.on('error', () => {
+                    /* ignore */
+                });
+                this.activeSocket.destroy();
+            } catch {
+                /* ignore */
+            }
+            this.activeSocket = null;
+        }
+    }
+
+    private resetConnectionState(reason: string): void {
+        this.log.warn(`Verbindung zur Luxtronik wird zurückgesetzt (${reason})`);
+        this.pollQueue = [];
+        this.currentPollCycleActive = false;
+        for (const key of Object.keys(this.errorCounters)) {
+            this.errorCounters[key] = 0;
+        }
+        void this.setState('info.connection', false, true);
+    }
+
+    // --- Zentrale Queue-Steuerung ---
+
+    private enqueueCommand(name: string, taskFn: QueueTaskFn): void {
+        this.commandQueue.push({ name, taskFn });
+        this.processQueues();
+    }
+
+    private enqueuePoll(name: string, taskFn: QueueTaskFn): void {
+        this.pollQueue.push({ name, taskFn });
+        this.processQueues();
+    }
+
+    private processQueues(): void {
+        if (this.unloaded || this.isProcessingQueue || this.activeSocket) {
+            return;
+        }
+
+        const nextItem = this.commandQueue.shift() ?? this.pollQueue.shift();
+        if (!nextItem) {
+            this.currentPollCycleActive = false;
+            return;
+        }
+
+        this.isProcessingQueue = true;
+        // Nach einem Schreibbefehl (write_*) 2500 ms Pause für das Luxtronik-EEPROM einlegen,
+        // bevor der anschließende Reload (verify_*) startet. Sonst 300 ms Standardpause.
+        const delayAfterMs = nextItem.name.startsWith('write_') ? 2500 : 300;
+
+        try {
+            void nextItem.taskFn(() => {
+                this.isProcessingQueue = false;
+                this.later(() => this.processQueues(), delayAfterMs);
+            });
+        } catch (e) {
+            this.log.warn(`Fehler bei Ausführung von ${nextItem.name}: ${String(e)}`);
+            this.isProcessingQueue = false;
+            this.later(() => this.processQueues(), 500);
+        }
+    }
+
+    // --- Generische Socket-Kommunikation (Lesen & Schreiben) ---
+
+    private executeRead(
+        cmd: string,
+        isCompleteFn: (buf: string) => boolean,
+        parseFn: (raw: string) => Promise<boolean> | boolean,
+        doneCallback: (success?: boolean) => void
+    ): void {
+        if (this.unloaded) {
+            doneCallback(false);
+            return;
+        }
+
+        let rxBuffer = '';
+        let timedOut = false;
+        let hadError = false;
+        let connected = false;
+
+        const idleTimeout = Number(this.config.socketTimeout) || 15000;
+        const socket = new net.Socket();
+        this.activeSocket = socket;
+
+        socket.setTimeout(idleTimeout);
+
+        const hardTimer = this.later(() => {
+            if (!socket.destroyed) {
+                this.log.warn(`${cmd}: Anfrage dauert zu lange (Hard-Timeout), Verbindung wird geschlossen`);
+                timedOut = true;
+                socket.destroy();
+            }
+        }, idleTimeout * 3);
+
+        socket.on('connect', () => {
+            connected = true;
+            this.log.debug(`${cmd}: Verbunden mit Luxtronik`);
+            socket.write(`${cmd}\r\n`);
+        });
+
+        socket.on('data', (chunk: Buffer) => {
+            rxBuffer += chunk.toString('utf8');
+            try {
+                if (isCompleteFn(rxBuffer)) {
+                    this.log.debug(`${cmd}: Daten vollständig empfangen`);
+                    socket.destroy();
+                }
+            } catch (e) {
+                this.log.warn(`${cmd}: Fehler bei Vollständigkeitsprüfung: ${String(e)}`);
+            }
+        });
+
+        socket.on('timeout', () => {
+            timedOut = true;
+            if (connected) {
+                this.log.warn(`${cmd}: Timeout nach ${idleTimeout} ms (${rxBuffer.length} Zeichen empfangen)`);
+            } else {
+                this.log.warn(`${cmd}: Keine Verbindung zum RS232-Konverter möglich (Timeout ${idleTimeout} ms)`);
+            }
+            socket.destroy();
+        });
+
+        socket.on('error', (err: Error) => {
+            hadError = true;
+            this.log.warn(`${cmd} Socket-Fehler: ${err.message}`);
+        });
+
+        socket.on('close', () => {
+            this.clearTrackedTimer(hardTimer);
+            if (this.activeSocket === socket) {
+                this.activeSocket = null;
+            }
+
+            if (hadError || timedOut) {
+                void this.setState('info.connection', false, true);
+                if (timedOut && this.pollQueue.length > 0) {
+                    this.log.debug(
+                        `Abfragezyklus wegen Timeout abgebrochen (${this.pollQueue.length} Abfragen übersprungen)`
+                    );
+                    this.pollQueue = [];
+                    this.currentPollCycleActive = false;
+                }
+                doneCallback(false);
+                return;
+            }
+
+            void (async () => {
+                let success = false;
+                try {
+                    success = await parseFn(rxBuffer.trim());
+                } catch (e) {
+                    this.log.warn(`callluxtronik${cmd} - Parse-Fehler: ${String(e)}`);
+                    success = false;
+                }
+
+                if (success) {
+                    this.errorCounters[cmd] = 0;
+                } else {
+                    this.errorCounters[cmd] = (this.errorCounters[cmd] ?? 0) + 1;
+                    this.log.debug(
+                        `Datensatz ${cmd} unvollständig/ungültig (Fehler #${this.errorCounters[cmd]})`
+                    );
+                    if (this.errorCounters[cmd] > 4) {
+                        this.resetConnectionState(`Mehrfach unvollständiger Datensatz ${cmd}`);
+                    }
+                }
+
+                doneCallback(success);
+            })();
+        });
+
+        socket.connect(this.port, this.deviceIpAddress);
+    }
+
+    private executeWrite(
+        cmd: string,
+        payloadLine: string,
+        onCloseParseFn: ((raw: string) => Promise<void> | void) | null,
+        doneCallback: (success?: boolean) => void
+    ): void {
+        if (this.unloaded) {
+            doneCallback(false);
+            return;
+        }
+
+        let rxBuffer = '';
+        let recoveryTriggered = false;
+        let stepTimer1: ioBroker.Timeout | undefined;
+        let stepTimer2: ioBroker.Timeout | undefined;
+        let closeAfterWriteTimer: ioBroker.Timeout | undefined;
+
+        const idleTimeout = Number(this.config.socketTimeout) || 15000;
+        const socket = new net.Socket();
+        this.activeSocket = socket;
+
+        socket.setTimeout(idleTimeout);
+
+        const hardTimer = this.later(() => {
+            if (!socket.destroyed) {
+                this.log.warn(`${cmd} (Write): Hard-Timeout erreicht, Verbindung wird geschlossen`);
+                socket.destroy();
+            }
+        }, idleTimeout * 3);
+
+        const safeWrite = (str: string): void => {
+            if (!socket.destroyed && socket.writable) {
+                socket.write(str);
+            }
+        };
+
+        socket.on('connect', () => {
+            this.log.debug(`${cmd}: Verbunden mit Luxtronik (Write)`);
+            safeWrite(`${cmd}\r\n`);
+            stepTimer1 = this.later(() => {
+                if (!recoveryTriggered) {
+                    safeWrite(`${payloadLine}\r\n`);
+                }
+            }, 1500);
+            stepTimer2 = this.later(() => {
+                if (!recoveryTriggered) {
+                    safeWrite('999\r\n');
+                    // Fallback: Falls die Luxtronik kein "993\r\n999" sendet,
+                    // Verbindung 1000 ms nach dem Speicherbefehl (999) regulär beenden
+                    closeAfterWriteTimer = this.later(() => {
+                        if (!socket.destroyed) {
+                            this.log.debug(
+                                `${cmd}: Schreibsequenz beendet, schließe Socket (${rxBuffer.length} Bytes empfangen)`
+                            );
+                            socket.destroy();
+                        }
+                    }, 1000);
+                }
+            }, 3000);
+        });
+
+        socket.on('data', (chunk: Buffer) => {
+            rxBuffer += chunk.toString('utf8');
+            try {
+                if (rxBuffer.includes('779') && !recoveryTriggered) {
+                    recoveryTriggered = true;
+                    this.clearTrackedTimer(stepTimer1);
+                    this.clearTrackedTimer(stepTimer2);
+                    this.clearTrackedTimer(closeAfterWriteTimer);
+                    this.log.warn(`${cmd}: Kommunikationsstörung (779) erkannt, führe Reset-Sequenz aus...`);
+
+                    this.later(() => safeWrite(`${cmd}\r\n`), 300);
+                    this.later(() => safeWrite(`${cmd};0\r\n`), 1000);
+                    this.later(() => safeWrite('999\r\n'), 1800);
+                    this.later(() => {
+                        if (!socket.destroyed) {
+                            socket.destroy();
+                        }
+                    }, 2500);
+                    return;
+                }
+
+                // Sobald 993/999 oder das Echo von 999 am Ende eintrifft, sauber schließen
+                if (
+                    rxBuffer.includes('993\r\n999') ||
+                    rxBuffer.includes('993\n999') ||
+                    rxBuffer.endsWith('999\r\n') ||
+                    rxBuffer.endsWith('999\n')
+                ) {
+                    this.clearTrackedTimer(closeAfterWriteTimer);
+                    socket.destroy();
+                }
+            } catch (e) {
+                this.log.debug(`${cmd}: Fehler bei Störungsbehebung: ${String(e)}`);
+            }
+        });
+
+        socket.on('timeout', () => {
+            this.log.warn(`${cmd} (Write): Timeout nach ${idleTimeout} ms`);
+            socket.destroy();
+        });
+
+        socket.on('error', (err: Error) => {
+            this.log.warn(`${cmd} (Write) Socket-Fehler: ${err.message}`);
+        });
+
+        socket.on('close', () => {
+            this.clearTrackedTimer(hardTimer);
+            this.clearTrackedTimer(stepTimer1);
+            this.clearTrackedTimer(stepTimer2);
+            this.clearTrackedTimer(closeAfterWriteTimer);
+            if (this.activeSocket === socket) {
+                this.activeSocket = null;
+            }
+
+            void (async () => {
+                try {
+                    if (rxBuffer !== '' && !recoveryTriggered && onCloseParseFn) {
+                        await onCloseParseFn(rxBuffer.trim());
+                    } else if (recoveryTriggered) {
+                        this.log.warn(
+                            `${cmd}: Editiermodus wurde nach Fehler 779 zurückgesetzt. Befehl wird erneut eingereiht.`
+                        );
+                        this.later(() => {
+                            this.enqueueCommand(`write_${cmd}_retry`, (cb) =>
+                                this.executeWrite(cmd, payloadLine, onCloseParseFn, cb)
+                            );
+                        }, 1000);
+                    }
+                } catch (e) {
+                    this.log.warn(`callluxtronik${cmd} - Fehler: ${String(e)}`);
+                }
+
+                this.log.debug(`Daten ${cmd} fertig verarbeitet.`);
+                doneCallback(!recoveryTriggered);
+            })();
+        });
+
+        socket.connect(this.port, this.deviceIpAddress);
+    }
+
+    private isSingleLineComplete(expectedCmd: string, buffer: string): boolean {
+        if (!buffer.includes(expectedCmd)) {
+            return false;
+        }
+        if (!buffer.endsWith('\n') && !buffer.endsWith('\r')) {
+            return false;
+        }
+        const clean = buffer.replace(/(\r\n|\n|\r)/gm, '');
+        const parts = clean.split(';');
+        const expectedCount = parseInt(parts[1], 10);
+        return !Number.isNaN(expectedCount) && parts.length === expectedCount + 2;
+    }
+
+    // --- Spezifische Lese-Funktionen ---
+
+    private callLuxtronik1100(done: (success?: boolean) => void): void {
+        this.executeRead(
+            '1100',
+            (buf) => this.isSingleLineComplete('1100', buf),
+            async (raw) => {
+                if (raw.length <= 40) {
+                    return false;
+                }
+                const arr = raw.replace(/(\r\n|\n|\r)/gm, '').split(';');
+                if (arr.length !== parseInt(arr[1], 10) + 2) {
+                    return false;
+                }
+
+                if (this.lastsetbws !== null && Number(arr[8]) !== Number(this.lastsetbws)) {
+                    this.log.info(
+                        `BW-Solltemperatur nicht korrekt gesetzt (${arr[8]} statt ${this.lastsetbws}), Vorgang wird wiederholt`
+                    );
+                    if ((this.errorCounters['1100_bws'] ?? 0) < 5) {
+                        this.errorCounters['1100_bws'] = (this.errorCounters['1100_bws'] ?? 0) + 1;
+                        this.controlBws(this.lastsetbws);
+                    } else {
+                        this.errorCounters['1100_bws'] = 0;
+                        this.resetConnectionState('Setzen der BW-Solltemperatur mehrmals fehlgeschlagen');
+                    }
+                    return true;
+                }
+
+                this.errorCounters['1100_bws'] = 0;
+                await this.setStateAsync('temperaturen.VL', Number(arr[2]) / 10, true);
+                await this.setStateAsync('temperaturen.RL', Number(arr[3]) / 10, true);
+                await this.setStateAsync('temperaturen.RLs', Number(arr[4]) / 10, true);
+                await this.setStateAsync('temperaturen.HG', Number(arr[5]) / 10, true);
+                await this.setStateAsync('temperaturen.AUT', Number(arr[6]) / 10, true);
+                await this.setStateAsync('temperaturen.BWi', Number(arr[7]) / 10, true);
+                await this.setStateAsync('temperaturen.BWs', Number(arr[8]) / 10, true);
+                await this.setStateAsync('temperaturen.WQe', Number(arr[9]) / 10, true);
+                await this.setStateAsync('temperaturen.WQa', Number(arr[10]) / 10, true);
+                await this.setStateAsync('temperaturen.MK1VLi', Number(arr[11]) / 10, true);
+                await this.setStateAsync('temperaturen.MK1VLs', Number(arr[12]) / 10, true);
+                await this.setStateAsync('temperaturen.RS', Number(arr[13]) / 10, true);
+                return true;
+            },
+            done
+        );
+    }
+
+    private callLuxtronik1800(done: (success?: boolean) => void): void {
+        this.executeRead(
+            '1800',
+            (buf) => buf.includes('1800;8', 10) && (buf.endsWith('\n') || buf.endsWith('\r')),
+            async (raw) => {
+                if (raw.length <= 500) {
+                    return false;
+                }
+                const lines = raw.split(/\r?\n/);
+                if (lines.length <= 21) {
+                    return false;
+                }
+
+                const temperaturen = lines[2].split(';'); // 1100
+                await this.setStateAsync('temperaturen.VL', Number(temperaturen[2]) / 10, true);
+                await this.setStateAsync('temperaturen.RL', Number(temperaturen[3]) / 10, true);
+                await this.setStateAsync('temperaturen.RLs', Number(temperaturen[4]) / 10, true);
+                await this.setStateAsync('temperaturen.HG', Number(temperaturen[5]) / 10, true);
+                await this.setStateAsync('temperaturen.AUT', Number(temperaturen[6]) / 10, true);
+                await this.setStateAsync('temperaturen.BWi', Number(temperaturen[7]) / 10, true);
+                await this.setStateAsync('temperaturen.BWs', Number(temperaturen[8]) / 10, true);
+                if (this.currentPollCycleActive) {
+                    await this.setStateAsync('control.BWs', Number(temperaturen[8]) / 10, true);
+                }
+                await this.setStateAsync('temperaturen.WQe', Number(temperaturen[9]) / 10, true);
+                await this.setStateAsync('temperaturen.WQa', Number(temperaturen[10]) / 10, true);
+                await this.setStateAsync('temperaturen.MK1VLi', Number(temperaturen[11]) / 10, true);
+                await this.setStateAsync('temperaturen.MK1VLs', Number(temperaturen[12]) / 10, true);
+                await this.setStateAsync('temperaturen.RS', Number(temperaturen[13]) / 10, true);
+
+                const eingaenge = lines[3].split(';'); // 1200
+                await this.setStateAsync('eingaenge.ASD', Boolean(Number(eingaenge[2])), true);
+                await this.setStateAsync('eingaenge.EVU', Boolean(Number(eingaenge[3])), true);
+                await this.setStateAsync('eingaenge.HD', Boolean(Number(eingaenge[4])), true);
+                await this.setStateAsync('eingaenge.MOT', Boolean(Number(eingaenge[5])), true);
+                await this.setStateAsync('eingaenge.ND', Boolean(Number(eingaenge[6])), true);
+                await this.setStateAsync('eingaenge.PEX', Boolean(Number(eingaenge[7])), true);
+
+                const ausgaenge = lines[4].split(';'); // 1300
+                await this.setStateAsync('ausgaenge.Abtauventil', Boolean(Number(ausgaenge[2])), true);
+                await this.setStateAsync(
+                    'ausgaenge.Brauchwarmwasserumwaelzpumpe',
+                    Boolean(Number(ausgaenge[3])),
+                    true
+                );
+                await this.setStateAsync(
+                    'ausgaenge.Fussbodenheizungsumwaelzpumpe',
+                    Boolean(Number(ausgaenge[4])),
+                    true
+                );
+                await this.setStateAsync('ausgaenge.Heizungsumwaelzpumpe', Boolean(Number(ausgaenge[5])), true);
+                await this.setStateAsync('ausgaenge.Mischer_1_Auf', Boolean(Number(ausgaenge[6])), true);
+                await this.setStateAsync('ausgaenge.Mischer_1_Zu', Boolean(Number(ausgaenge[7])), true);
+                await this.setStateAsync(
+                    'ausgaenge.Ventilation_des_Waermepumpengehaeuses',
+                    Boolean(Number(ausgaenge[8])),
+                    true
+                );
+                await this.setStateAsync(
+                    'ausgaenge.Ventilator_Brunnen_oder_Soleumwaelzpumpe',
+                    Boolean(Number(ausgaenge[9])),
+                    true
+                );
+                await this.setStateAsync(
+                    'ausgaenge.Verdichter_1_in_Waermepumpe',
+                    Boolean(Number(ausgaenge[10])),
+                    true
+                );
+                await this.setStateAsync(
+                    'ausgaenge.Verdichter_2_in_Waermepumpe',
+                    Boolean(Number(ausgaenge[11])),
+                    true
+                );
+                await this.setStateAsync(
+                    'ausgaenge.Zusatzumwaelzpumpe_Zirkulationspumpe',
+                    Boolean(Number(ausgaenge[12])),
+                    true
+                );
+                await this.setStateAsync('ausgaenge.Zweiter_Waermeerzeuger_1', Boolean(Number(ausgaenge[13])), true);
+                await this.setStateAsync(
+                    'ausgaenge.Zweiter_Waermeerzeuger_2_Sammelstoerung',
+                    Boolean(Number(ausgaenge[14])),
+                    true
+                );
+
+                const ablaufzeiten = lines[5].split(';'); // 1400
+                const currentWpSeit =
+                    parseInt(ablaufzeiten[2], 10) * 3600 +
+                    parseInt(ablaufzeiten[3], 10) * 60 +
+                    parseInt(ablaufzeiten[4], 10);
+
+                const prevWpSeitState = await this.getStateAsync('ablaufzeiten.WPseit');
+                if (prevWpSeitState && currentWpSeit === 0 && Number(prevWpSeitState.val) > 0) {
+                    await this.setStateAsync('ablaufzeiten.WPseitlast', Number(prevWpSeitState.val), true);
+                }
+                await this.setStateAsync('ablaufzeiten.WPseit', currentWpSeit, true);
+
+                await this.setStateAsync(
+                    'ablaufzeiten.ZWE1seit',
+                    parseInt(ablaufzeiten[5], 10) * 3600 +
+                        parseInt(ablaufzeiten[6], 10) * 60 +
+                        parseInt(ablaufzeiten[7], 10),
+                    true
+                );
+                await this.setStateAsync(
+                    'ablaufzeiten.ZWE2seit',
+                    parseInt(ablaufzeiten[8], 10) * 3600 +
+                        parseInt(ablaufzeiten[9], 10) * 60 +
+                        parseInt(ablaufzeiten[10], 10),
+                    true
+                );
+                await this.setStateAsync('ablaufzeiten.Netzeinv', parseInt(ablaufzeiten[11], 10), true);
+                await this.setStateAsync(
+                    'ablaufzeiten.SSPstand',
+                    parseInt(ablaufzeiten[12], 10) * 60 + parseInt(ablaufzeiten[13], 10),
+                    true
+                );
+                await this.setStateAsync(
+                    'ablaufzeiten.SSPverz',
+                    parseInt(ablaufzeiten[14], 10) * 60 + parseInt(ablaufzeiten[15], 10),
+                    true
+                );
+                await this.setStateAsync(
+                    'ablaufzeiten.VDstand',
+                    parseInt(ablaufzeiten[16], 10) * 3600 +
+                        parseInt(ablaufzeiten[17], 10) * 60 +
+                        parseInt(ablaufzeiten[18], 10),
+                    true
+                );
+                await this.setStateAsync(
+                    'ablaufzeiten.HRM',
+                    parseInt(ablaufzeiten[19], 10) * 3600 +
+                        parseInt(ablaufzeiten[20], 10) * 60 +
+                        parseInt(ablaufzeiten[21], 10),
+                    true
+                );
+                await this.setStateAsync(
+                    'ablaufzeiten.HRW',
+                    parseInt(ablaufzeiten[22], 10) * 3600 +
+                        parseInt(ablaufzeiten[23], 10) * 60 +
+                        parseInt(ablaufzeiten[24], 10),
+                    true
+                );
+                await this.setStateAsync(
+                    'ablaufzeiten.TDIseit',
+                    parseInt(ablaufzeiten[25], 10) * 3600 +
+                        parseInt(ablaufzeiten[26], 10) * 60 +
+                        parseInt(ablaufzeiten[27], 10),
+                    true
+                );
+                await this.setStateAsync(
+                    'ablaufzeiten.BWsperre',
+                    parseInt(ablaufzeiten[28], 10) * 3600 +
+                        parseInt(ablaufzeiten[29], 10) * 60 +
+                        parseInt(ablaufzeiten[30], 10),
+                    true
+                );
+
+                const betriebsstunden = lines[6].split(';');
+                await this.setStateAsync('betriebsstunden.VD1', this.toTimeString(betriebsstunden[2]), true);
+                await this.setStateAsync('betriebsstunden.Imp1', String(betriebsstunden[3]), true);
+                await this.setStateAsync('betriebsstunden.AvVD1', this.toTimeString(betriebsstunden[4]), true);
+                await this.setStateAsync('betriebsstunden.VD2', this.toTimeString(betriebsstunden[5]), true);
+                await this.setStateAsync('betriebsstunden.Imp2', String(betriebsstunden[6]), true);
+                await this.setStateAsync('betriebsstunden.AvVD2', this.toTimeString(betriebsstunden[7]), true);
+                await this.setStateAsync('betriebsstunden.ZWE1', this.toTimeString(betriebsstunden[8]), true);
+                await this.setStateAsync('betriebsstunden.ZWE2', this.toTimeString(betriebsstunden[9]), true);
+                await this.setStateAsync('betriebsstunden.WP', this.toTimeString(betriebsstunden[10]), true);
+
+                for (let i = 1; i < 6; i++) {
+                    await this.setStateAsync(`fehler.${6 - i}`, this.setFehlerText(lines[7 + i]), true);
+                    await this.setStateAsync(`abschaltungen.${6 - i}`, this.setAbschaltText(lines[14 + i]), true);
+                }
+
+                const statusParts = lines[21].split(';');
+                await this.setStateAsync('status.WPtyp', String(statusParts[2]), true);
+                await this.setStateAsync('status.SW', String(statusParts[3]), true);
+                await this.setStateAsync('status.BivStufe', String(statusParts[4]), true);
+                await this.setStateAsync('status.ANL', this.setStatusText(String(lines[21])), true);
+
+                await this.setStateAsync('info.connection', true, true);
+                return true;
+            },
+            done
+        );
+    }
+
+    private callLuxtronik2100(done: (success?: boolean) => void): void {
+        this.executeRead(
+            '2100',
+            (buf) => this.isSingleLineComplete('2100', buf),
+            async (raw) => {
+                const arr = raw.replace(/(\r\n|\n|\r)/gm, '').split(';');
+                if (arr.length !== parseInt(arr[1], 10) + 2) {
+                    return false;
+                }
+
+                this.lastData2100 = arr.slice();
+                await this.setStateAsync('temperaturen.einstellungen.RLBegr', Number(arr[2]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.HystHR', Number(arr[3]) / 10, true);
+                if (this.currentPollCycleActive) {
+                    await this.setStateAsync('control.HystHKs', Number(arr[3]) / 10, true);
+                }
+                await this.setStateAsync('temperaturen.einstellungen.TRErhMax', Number(arr[4]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.Freig2VD', Number(arr[5]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.FreigZWE', Number(arr[6]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.T-Luftabt', Number(arr[7]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.TDIsoll', Number(arr[8]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.HystBW', Number(arr[9]) / 10, true);
+                if (this.currentPollCycleActive) {
+                    await this.setStateAsync('control.HystBWs', Number(arr[9]) / 10, true);
+                }
+                await this.setStateAsync('temperaturen.einstellungen.VL2VDBW', Number(arr[10]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.TAussenMax', Number(arr[11]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.TAussenMin', Number(arr[12]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.TWQMin', Number(arr[13]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.THGMax', Number(arr[14]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.TLAbtEnde', Number(arr[15]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.AbsenkBis', Number(arr[16]) / 10, true);
+                await this.setStateAsync('temperaturen.einstellungen.VLmax', Number(arr[17]) / 10, true);
+                return true;
+            },
+            done
+        );
+    }
+
+    private callLuxtronik3405(done: (success?: boolean) => void): void {
+        this.executeRead(
+            '3405',
+            (buf) => this.isSingleLineComplete('3405', buf),
+            async (raw) => {
+                const arr = raw.replace(/(\r\n|\n|\r)/gm, '').split(';');
+                if (arr.length !== parseInt(arr[1], 10) + 2) {
+                    return false;
+                }
+                const val = parseInt(arr[2], 10);
+                await this.setStateAsync('status.ModusHeizung', val, true);
+                if (this.currentPollCycleActive) {
+                    await this.setStateAsync('control.ModusHeizung', val, true);
+                }
+                return true;
+            },
+            done
+        );
+    }
+
+    private callLuxtronik3505(done: (success?: boolean) => void): void {
+        this.executeRead(
+            '3505',
+            (buf) => this.isSingleLineComplete('3505', buf),
+            async (raw) => {
+                const arr = raw.replace(/(\r\n|\n|\r)/gm, '').split(';');
+                if (arr.length !== parseInt(arr[1], 10) + 2) {
+                    return false;
+                }
+                const val = parseInt(arr[2], 10);
+                await this.setStateAsync('status.ModusWW', val, true);
+                if (this.currentPollCycleActive) {
+                    await this.setStateAsync('control.ModusWW', val, true);
+                }
+                return true;
+            },
+            done
+        );
+    }
+
+    private callLuxtronik3400(done: (success?: boolean) => void): void {
+        this.executeRead(
+            '3400',
+            (buf) => this.isSingleLineComplete('3400', buf),
+            async (raw) => {
+                const arr = raw.replace(/(\r\n|\n|\r)/gm, '').split(';');
+                if (arr.length !== 11) {
+                    return false;
+                }
+
+                this.lastData3400 = arr.slice();
+                await this.setStateAsync('heizkurve.AbwRLs', Number(arr[2]) / 10, true);
+                await this.setStateAsync('heizkurve.Endpunkt', Number(arr[3]) / 10, true);
+                await this.setStateAsync('heizkurve.ParaV', Number(arr[4]) / 10, true);
+                await this.setStateAsync('heizkurve.NachtAbs', Number(arr[5]) / 10, true);
+                if (this.currentPollCycleActive) {
+                    await this.setStateAsync('control.AbwRLs', Number(arr[2]) / 10, true);
+                    await this.setStateAsync('control.EndpunktHK', Number(arr[3]) / 10, true);
+                    await this.setStateAsync('control.ParaVHK', Number(arr[4]) / 10, true);
+                    await this.setStateAsync('control.NachtAbs', Number(arr[5]) / 10, true);
+                }
+                return true;
+            },
+            done
+        );
+    }
+
+    private callLuxtronik3200(done: (success?: boolean) => void): void {
+        this.executeRead(
+            '3200',
+            (buf) => this.isSingleLineComplete('3200', buf),
+            async (raw) => {
+                const arr = raw.replace(/(\r\n|\n|\r)/gm, '').split(';');
+                if (arr.length !== parseInt(arr[1], 10) + 2) {
+                    return false;
+                }
+
+                const s1 = `${arr[2].padStart(2, '0')}:${arr[3].padStart(2, '0')}`;
+                const e1 = `${arr[4].padStart(2, '0')}:${arr[5].padStart(2, '0')}`;
+                const s2 = `${arr[6].padStart(2, '0')}:${arr[7].padStart(2, '0')}`;
+                const e2 = `${arr[8].padStart(2, '0')}:${arr[9].padStart(2, '0')}`;
+
+                if (!this.schaltzbwblock) {
+                    await this.setStateAsync('control.SchaltzWoBW.Start1', s1, true);
+                    await this.setStateAsync('control.SchaltzWoBW.Ende1', e1, true);
+                    await this.setStateAsync('control.SchaltzWoBW.Start2', s2, true);
+                    await this.setStateAsync('control.SchaltzWoBW.Ende2', e2, true);
+                }
+                await this.setStateAsync('status.SchaltzWoBW.Start1', s1, true);
+                await this.setStateAsync('status.SchaltzWoBW.Ende1', e1, true);
+                await this.setStateAsync('status.SchaltzWoBW.Start2', s2, true);
+                await this.setStateAsync('status.SchaltzWoBW.Ende2', e2, true);
+                return true;
+            },
+            done
+        );
+    }
+
+    // --- Transaktions-Helfer für Read-Modify-Write ---
+
+    private updateHeizkurveField(index: number, value: number): void {
+        this.enqueueCommand('read_3400_for_write', (cb) => {
+            this.lastData3400 = null;
+            this.callLuxtronik3400(cb);
+        });
+        this.enqueueCommand('write_3401', (cb) => {
+            if (!this.lastData3400 || this.lastData3400.length < 11) {
+                this.log.warn('Heizkurve nicht geändert: aktuelle Werte (3400) konnten nicht gelesen werden');
+                cb(false);
+                return;
+            }
+            const dataHK = this.lastData3400.map((v) => String(v).trim());
+            dataHK[0] = '3401';
+            dataHK[index] = String(value);
+            this.executeWrite('3401', dataHK.join(';'), null, cb);
+        });
+        this.enqueueCommand('verify_3400', (cb) => this.callLuxtronik3400(cb));
+    }
+
+    private updateHystereseField(index: number, value: number): void {
+        this.enqueueCommand('read_2100_for_write', (cb) => {
+            this.lastData2100 = null;
+            this.callLuxtronik2100(cb);
+        });
+        this.enqueueCommand('write_2101', (cb) => {
+            if (!this.lastData2100 || this.lastData2100.length < 10) {
+                this.log.warn('Hysterese nicht geändert: aktuelle Werte (2100) konnten nicht gelesen werden');
+                cb(false);
+                return;
+            }
+            const dataHyst = this.lastData2100.map((v) => String(v).trim());
+            dataHyst[0] = '2101';
+            dataHyst[index] = String(value);
+            this.executeWrite('2101', dataHyst.join(';'), null, cb);
+        });
+        this.enqueueCommand('verify_2100', (cb) => this.callLuxtronik2100(cb));
+    }
+
+    // --- Steuerfunktionen ---
+
+    private controlBws(statebws: number): void {
+        this.enqueueCommand('write_3501', (cb) => {
+            this.executeWrite(
+                '3501',
+                `3501;1;${statebws}`,
+                async (raw) => {
+                    const lines = raw.split(/\r?\n/);
+                    const confirmedVal = lines[3] ? lines[3].split(';')[2] : undefined;
+                    if (confirmedVal !== undefined && Number(confirmedVal) === Number(this.lastsetbws)) {
+                        this.bwretry = 0;
+                        await this.setStateAsync('temperaturen.BWs', Number(confirmedVal) / 10, true);
+                        this.enqueueCommand('verify_1100', (verifyCb) => this.callLuxtronik1100(verifyCb));
+                    } else {
+                        this.bwretry++;
+                        if (this.bwretry <= 3 && this.lastsetbws !== null) {
+                            this.log.debug(
+                                `BW-Solltemperatur setzen nicht erfolgreich, Wiederholung (${this.bwretry}/3)`
+                            );
+                            this.controlBws(this.lastsetbws);
+                        } else {
+                            this.log.warn('Warmwasser-Soll konnte nicht gesetzt werden, Vorgang abgebrochen');
+                        }
+                    }
+                },
+                cb
+            );
+        });
+    }
+
+    private controlModusWw(statemodusww: number): void {
+        this.enqueueCommand('write_3506', (cb) => {
+            this.executeWrite(
+                '3506',
+                `3506;1;${statemodusww}`,
+                async () => {
+                    await this.setStateAsync('status.ModusWW', statemodusww, true);
+                },
+                cb
+            );
+        });
+    }
+
+    private controlModusHeizung(statemodusheizung: number): void {
+        this.enqueueCommand('write_3406', (cb) => {
+            this.executeWrite(
+                '3406',
+                `3406;1;${statemodusheizung}`,
+                async () => {
+                    await this.setStateAsync('status.ModusHeizung', statemodusheizung, true);
+                },
+                cb
+            );
+        });
+    }
+
+    private controlSchaltzWoBW(arr: (string | number)[]): void {
+        this.schaltzbwblock = false;
+        this.enqueueCommand('write_3201', (cb) => {
+            this.executeWrite(
+                '3201',
+                arr.join(';'),
+                () => {
+                    this.enqueueCommand('verify_3200', (verifyCb) => this.callLuxtronik3200(verifyCb));
+                },
+                cb
+            );
+        });
+    }
+
+    private controlZeit(arr: (string | number)[]): void {
+        this.zeitblock = false;
+        this.enqueueCommand('write_2701', (cb) => {
+            this.executeWrite('2701', arr.join(';'), null, cb);
+        });
+    }
+
+    // --- Polling & State-Handling ---
+
+    private pollLuxtronik(): void {
+        if (this.pollQueue.length > 0 || this.isProcessingQueue) {
+            this.log.debug('Vorheriger Poll oder Befehl noch aktiv, überspringe diesen Zyklus');
+            return;
+        }
+        this.currentPollCycleActive = true;
+        this.enqueuePoll('1800', (cb) => this.callLuxtronik1800(cb));
+        this.enqueuePoll('2100', (cb) => this.callLuxtronik2100(cb));
+        this.enqueuePoll('3405', (cb) => this.callLuxtronik3405(cb));
+        this.enqueuePoll('3505', (cb) => this.callLuxtronik3505(cb));
+        this.enqueuePoll('3400', (cb) => this.callLuxtronik3400(cb));
+        this.enqueuePoll('3200', (cb) => this.callLuxtronik3200(cb));
+    }
+
+    private toTenths(value: ioBroker.StateValue, id: string): number | null {
+        const n = Number(value);
+        if (value === null || value === '' || typeof value === 'boolean' || !Number.isFinite(n)) {
+            this.log.warn(`Ungültiger Wert für ${id}: ${String(value)} - Befehl wird ignoriert`);
+            return null;
+        }
+        return Math.round(n * 10);
+    }
+
+    private async controlLuxtronik(id: string, stateVal: ioBroker.StateValue): Promise<void> {
+        try {
+            let tenths: number | null = null;
+            if (NUMERIC_CONTROLS.includes(id)) {
+                tenths = this.toTenths(stateVal, id);
+                if (tenths === null) {
+                    return;
+                }
+            }
+
+            switch (id) {
+                case 'control.BWs':
+                    this.bwretry = 0;
+                    this.lastsetbws = tenths!;
+                    this.controlBws(tenths!);
+                    break;
+                case 'control.ModusWW':
+                    this.controlModusWw(Number(stateVal));
+                    break;
+                case 'control.ModusHeizung':
+                    this.controlModusHeizung(Number(stateVal));
+                    break;
+                case 'control.AbwRLs':
+                    this.updateHeizkurveField(2, tenths!);
+                    break;
+                case 'control.EndpunktHK':
+                    this.updateHeizkurveField(3, tenths!);
+                    break;
+                case 'control.ParaVHK':
+                    this.updateHeizkurveField(4, tenths!);
+                    break;
+                case 'control.NachtAbs':
+                    this.updateHeizkurveField(5, tenths!);
+                    break;
+                case 'control.HystHKs':
+                    this.updateHystereseField(3, tenths!);
+                    break;
+                case 'control.HystBWs':
+                    this.updateHystereseField(9, tenths!);
+                    break;
+                case 'control.SchaltzWoBW.senden':
+                    await this.readStatesAndSendSchaltzeiten();
+                    break;
+                case 'control.Zeit.senden':
+                    await this.readStatesAndSendZeit();
+                    break;
+                default:
+                    if (id.includes('control.SchaltzWoBW.Start') || id.includes('control.SchaltzWoBW.Ende')) {
+                        this.schaltzbwblock = true;
+                        this.later(() => {
+                            this.schaltzbwblock = false;
+                        }, 60000);
+                    } else if (
+                        id.includes('control.Zeit.uhrzeit') ||
+                        id.includes('control.Zeit.dow') ||
+                        id.includes('control.Zeit.datum')
+                    ) {
+                        this.zeitblock = true;
+                        this.later(() => {
+                            this.zeitblock = false;
+                        }, 60000);
+                    }
+            }
+        } catch (e) {
+            this.log.warn(`controlluxtronik-Fehler: ${String(e)}`);
+        }
+    }
+
+    private async readStatesAndSendSchaltzeiten(): Promise<void> {
+        const keys = [
+            'control.SchaltzWoBW.Start1',
+            'control.SchaltzWoBW.Ende1',
+            'control.SchaltzWoBW.Start2',
+            'control.SchaltzWoBW.Ende2',
+        ];
+        const payload: (string | number)[] = ['3201', '8'];
+
+        for (const key of keys) {
+            const state = await this.getStateAsync(key);
+            if (!state || typeof state.val !== 'string') {
+                this.log.warn(`Fehler beim Auslesen von ${key}`);
+                return;
+            }
+            payload.push(Number(state.val.slice(0, 2)), Number(state.val.slice(-2)));
+        }
+
+        this.controlSchaltzWoBW(payload);
+    }
+
+    private async readStatesAndSendZeit(): Promise<void> {
+        const [sDatum, sDow, sZeit] = await Promise.all([
+            this.getStateAsync('control.Zeit.datum'),
+            this.getStateAsync('control.Zeit.dow'),
+            this.getStateAsync('control.Zeit.uhrzeit'),
+        ]);
+
+        if (!sDatum?.val || sDow?.val === undefined || sDow?.val === null || !sZeit?.val) {
+            this.log.warn('Fehler beim Auslesen der Zeitfelder');
+            return;
+        }
+
         const dStr = String(sDatum.val);
         const tStr = String(sZeit.val);
-        const payload = [
-          '2701',
-          '7',
-          Number(dStr.slice(-2)),
-          Number(dStr.slice(3, 5)),
-          Number(dStr.slice(0, 2)),
-          sDow.val,
-          Number(tStr.slice(0, 2)),
-          Number(tStr.slice(3, 5)),
-          Number(tStr.slice(-2))
+        const payload: (string | number)[] = [
+            '2701',
+            '7',
+            Number(dStr.slice(-2)),
+            Number(dStr.slice(3, 5)),
+            Number(dStr.slice(0, 2)),
+            Number(sDow.val),
+            Number(tStr.slice(0, 2)),
+            Number(tStr.slice(3, 5)),
+            Number(tStr.slice(-2)),
         ];
-        controlZeit(payload);
-      });
-    });
-  });
-}
-
-// --- Formatierungs-Helfer ---
-
-function setfehlertext(fehlerinfo) {
-  try {
-    if (!fehlerinfo) return '';
-    const arr = fehlerinfo.split(';');
-    const code = arr[3];
-    const zeit =
-      ('00' + arr[4]).slice(-2) + '.' +
-      ('00' + arr[5]).slice(-2) + '.' +
-      ('00' + arr[6]).slice(-2) + ', ' +
-      ('00' + arr[7]).slice(-2) + ':' +
-      ('00' + arr[8]).slice(-2);
-    const text = ERROR_CODES[code] !== undefined ? ERROR_CODES[code] : 'Unbekannter Fehler (' + code + ')';
-    return text + ' ' + zeit;
-  } catch (e) {
-    adapter.log.warn('setfehlertext - Fehler: ' + e);
-    return '';
-  }
-}
-
-function setabschalttext(abschaltinfo) {
-  try {
-    if (!abschaltinfo) return '';
-    const arr = abschaltinfo.split(';');
-    const code = arr[3];
-    const zeit =
-      ('00' + arr[4]).slice(-2) + '.' +
-      ('00' + arr[5]).slice(-2) + '.' +
-      ('00' + arr[6]).slice(-2) + ', ' +
-      ('00' + arr[7]).slice(-2) + ':' +
-      ('00' + arr[8]).slice(-2);
-    const map = {
-      '010': 'weniger Waerme, ',
-      '001': 'Waermepumpenstoerung, ',
-      '002': 'Anlagenstoerung, '
-    };
-    return (map[code] || '') + ' ' + zeit;
-  } catch (e) {
-    adapter.log.warn('setabschalttext - Fehler: ' + e);
-    return '';
-  }
-}
-
-function setstatustext(statuscode) {
-  try {
-    const code = statuscode.split(';')[5];
-    const map = {
-      '0': 'Heizung',
-      '1': 'Warmwasser',
-      '2': 'Schwimmbad',
-      '3': 'EVU-Sperre',
-      '4': 'Abtauen',
-      '5': 'Bereitschaft'
-    };
-    return map[code] || 'Status unklar';
-  } catch (e) {
-    adapter.log.warn('setstatustext - Fehler: ' + e);
-    return 'Status unklar';
-  }
-}
-
-function toTimeString(totalseconds) {
-  try {
-    const total = Number(totalseconds) || 0;
-    const hours = Math.floor(total / 3600);
-    const minutes = Math.floor((total - hours * 3600) / 60);
-    const seconds = Math.floor(total - hours * 3600 - minutes * 60);
-    return (
-      (hours < 10 ? '0' + hours : hours) + 'h ' +
-      (minutes < 10 ? '0' + minutes : minutes) + 'min ' +
-      (seconds < 10 ? '0' + seconds : seconds) + 's'
-    );
-  } catch (e) {
-    adapter.log.warn('toTimeString - Fehler: ' + e);
-    return '00h 00min 00s';
-  }
-}
-
-// --- Adapter-Lifecycle ---
-
-function startAdapter(options) {
-  options = Object.assign({}, options, { name: 'luxtronik1' });
-  adapter = new utils.Adapter(options);
-
-  adapter.on('unload', (callback) => {
-    try {
-      shutdown();
-      adapter.log.info('[END] Stopping luxtronik adapter...');
-      adapter.setState('info.connection', false, true);
-      callback();
-    } catch (e) {
-      callback();
+        this.controlZeit(payload);
     }
-  });
 
-  adapter.on('stateChange', (id, state) => {
-    if (!id || !state || state.ack) return;
-    const shortId = id.substring(adapter.namespace.length + 1);
-    adapter.log.debug('Steuerbefehl empfangen: ' + shortId + ' = ' + state.val);
-    controlluxtronik(shortId, state.val);
-  });
+    // --- Formatierungs-Helfer ---
 
-  adapter.on('ready', () => {
-    if (!adapter.config.host) {
-      adapter.log.warn('[START] Keine IP-Adresse konfiguriert');
-      return;
+    private setFehlerText(fehlerinfo?: string): string {
+        try {
+            if (!fehlerinfo) {
+                return '';
+            }
+            const arr = fehlerinfo.split(';');
+            const code = arr[3];
+            const zeit = `${`00${arr[4]}`.slice(-2)}.${`00${arr[5]}`.slice(-2)}.${`00${arr[6]}`.slice(-2)}, ${`00${arr[7]}`.slice(-2)}:${`00${arr[8]}`.slice(-2)}`;
+            const text = ERROR_CODES[code] !== undefined ? ERROR_CODES[code] : `Unbekannter Fehler (${code})`;
+            return `${text} ${zeit}`;
+        } catch (e) {
+            this.log.warn(`setfehlertext - Fehler: ${String(e)}`);
+            return '';
+        }
     }
-    unloaded = false;
-    adapter.setState('info.connection', false, true);
-    main();
-  });
 
-  return adapter;
+    private setAbschaltText(abschaltinfo?: string): string {
+        try {
+            if (!abschaltinfo) {
+                return '';
+            }
+            const arr = abschaltinfo.split(';');
+            const code = arr[3];
+            const zeit = `${`00${arr[4]}`.slice(-2)}.${`00${arr[5]}`.slice(-2)}.${`00${arr[6]}`.slice(-2)}, ${`00${arr[7]}`.slice(-2)}:${`00${arr[8]}`.slice(-2)}`;
+            const map: Record<string, string> = {
+                '010': 'weniger Waerme, ',
+                '001': 'Waermepumpenstoerung, ',
+                '002': 'Anlagenstoerung, ',
+            };
+            return `${map[code] ?? ''} ${zeit}`;
+        } catch (e) {
+            this.log.warn(`setabschalttext - Fehler: ${String(e)}`);
+            return '';
+        }
+    }
+
+    private setStatusText(statuscode: string): string {
+        try {
+            const code = statuscode.split(';')[5];
+            const map: Record<string, string> = {
+                '0': 'Heizung',
+                '1': 'Warmwasser',
+                '2': 'Schwimmbad',
+                '3': 'EVU-Sperre',
+                '4': 'Abtauen',
+                '5': 'Bereitschaft',
+            };
+            return map[code] ?? 'Status unklar';
+        } catch (e) {
+            this.log.warn(`setstatustext - Fehler: ${String(e)}`);
+            return 'Status unklar';
+        }
+    }
+
+    private toTimeString(totalseconds: string | number): string {
+        try {
+            const total = Number(totalseconds) || 0;
+            const hours = Math.floor(total / 3600);
+            const minutes = Math.floor((total - hours * 3600) / 60);
+            const seconds = Math.floor(total - hours * 3600 - minutes * 60);
+            const hStr = hours < 10 ? `0${hours}` : String(hours);
+            const mStr = minutes < 10 ? `0${minutes}` : String(minutes);
+            const sStr = seconds < 10 ? `0${seconds}` : String(seconds);
+            return `${hStr}h ${mStr}min ${sStr}s`;
+        } catch (e) {
+            this.log.warn(`toTimeString - Fehler: ${String(e)}`);
+            return '00h 00min 00s';
+        }
+    }
 }
 
-function main() {
-  deviceIpAddress = adapter.config.host;
-  port = parseInt(adapter.config.port, 10);
-  if (!(port > 0 && port < 65536)) {
-    adapter.log.error('[START] Ungültiger Port: ' + adapter.config.port);
-    return;
-  }
-
-  const pollingTime = Math.max(parseInt(adapter.config.pollInterval, 10) || 300000, 10000);
-  adapter.log.info('[START] Luxtronik-Adapter gestartet (' + deviceIpAddress + ':' + port + ', Intervall: ' + pollingTime + ' ms)');
-
-  adapter.subscribeStates('control.*');
-  pollluxtronik();
-
-  polling = setInterval(() => {
-    if (!unloaded) pollluxtronik();
-  }, pollingTime);
-}
-
-if (module && module.parent) {
-  module.exports = startAdapter;
+if (require.main !== module) {
+    module.exports = (options: Partial<utils.AdapterOptions> | undefined) => new Luxtronik1(options);
 } else {
-  startAdapter();
+    (() => new Luxtronik1())();
 }
