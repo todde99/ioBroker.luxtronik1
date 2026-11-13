@@ -1,10 +1,28 @@
 {
   "name": "iobroker.luxtronik1",
-  "version": "0.5.6",
+  "version": "0.6.0",
   "description": "Control your Luxtronik 1 heatpump controller",
   "author": "forelleblau <marceladam@gmx.ch>",
+  "contributors": [
+    "todde99"
+  ],
+  "homepage": "https://github.com/todde99/ioBroker.luxtronik1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/todde99/ioBroker.luxtronik1.git"
+  },
+  "bugs": {
+    "url": "https://github.com/todde99/ioBroker.luxtronik1/issues"
+  },
   "license": "MIT",
   "main": "build/main.js",
+  "files": [
+    "admin/",
+    "build/",
+    "io-package.json",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
     "watch": "tsc -w",
@@ -22,7 +40,7 @@
     "@iobroker/adapter-core": "^3.2.2"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^22.0.0",
     "typescript": "^5.6.3"
   },
   "engines": {
